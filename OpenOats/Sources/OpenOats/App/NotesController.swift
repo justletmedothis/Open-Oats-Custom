@@ -1034,6 +1034,13 @@ final class NotesController {
         }
     }
 
+    func updateSessionSpeakerNames(sessionID: String, speakerNames: [String: String]) {
+        Task {
+            await coordinator.sessionRepository.updateSessionSpeakerNames(sessionID: sessionID, speakerNames: speakerNames)
+            await loadHistory()
+        }
+    }
+
     func setTagFilter(_ tag: String?) {
         state.tagFilter = tag
     }

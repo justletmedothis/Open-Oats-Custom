@@ -157,6 +157,8 @@ struct SessionMetadata: Codable, Sendable {
     var transcriptIssue: SessionTranscriptIssue?
     var transcriptRecovery: SessionTranscriptRecoveryState? = nil
     var customNotesGuidance: String?
+    /// Per-session custom speaker display names. Keys are Speaker.storageKey values.
+    var speakerNames: [String: String]?
 }
 
 // MARK: - SessionRepository
@@ -856,7 +858,8 @@ actor SessionRepository {
                         source: meta.source,
                         meetingFamilyKey: meta.calendarEvent.flatMap { MeetingHistoryResolver.seriesHistoryKey(for: $0) },
                         transcriptIssue: meta.transcriptIssue,
-                        transcriptRecovery: meta.transcriptRecovery
+                        transcriptRecovery: meta.transcriptRecovery,
+                        speakerNames: meta.speakerNames
                     ))
                     continue
                 }
@@ -897,7 +900,8 @@ actor SessionRepository {
                 source: meta.source,
                 meetingFamilyKey: meta.calendarEvent.flatMap { MeetingHistoryResolver.seriesHistoryKey(for: $0) },
                 transcriptIssue: meta.transcriptIssue,
-                transcriptRecovery: meta.transcriptRecovery
+                transcriptRecovery: meta.transcriptRecovery,
+                speakerNames: meta.speakerNames
             )
 
             let transcript = loadTranscript(sessionID: id)
@@ -1037,6 +1041,12 @@ actor SessionRepository {
         )
         let dir = sessionDirectory(for: sessionID)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        writeSessionMetadata(meta, sessionID: sessionID)
+    }
+
+    func updateSessionSpeakerNames(sessionID: String, speakerNames: [String: String]) {
+        guard var meta = loadSessionMetadataFile(sessionID: sessionID) else { return }
+        meta.speakerNames = speakerNames.isEmpty ? nil : speakerNames
         writeSessionMetadata(meta, sessionID: sessionID)
     }
 

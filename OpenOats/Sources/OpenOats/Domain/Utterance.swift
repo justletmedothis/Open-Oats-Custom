@@ -15,6 +15,10 @@ enum Speaker: Codable, Sendable, Hashable {
         }
     }
 
+    func displayName(speakerNames: [String: String]?) -> String {
+        speakerNames?[storageKey] ?? displayLabel
+    }
+
     /// True for any non-mic speaker (.them or .remote).
     var isRemote: Bool {
         switch self {

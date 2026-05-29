@@ -511,6 +511,8 @@ struct SessionIndex: Identifiable, Codable, Sendable, Equatable {
     var transcriptIssue: SessionTranscriptIssue? = nil
     /// Non-nil when a previously failed transcript was later recovered.
     var transcriptRecovery: SessionTranscriptRecoveryState? = nil
+    /// Per-session custom speaker display names. Keys are Speaker.storageKey values.
+    var speakerNames: [String: String]? = nil
 }
 
 struct SessionSidecar: Codable, Sendable {

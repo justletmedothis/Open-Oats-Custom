@@ -46,6 +46,8 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
     @State private var renamingSessionID: String?
     @State private var renameText: String = ""
     @FocusState private var renameFieldFocused: Bool
+    @State private var renamingSpeakerKey: String? = nil
+    @State private var speakerRenameText: String = ""
     @State private var editingTagsSessionID: String?
     @State private var editingTags: [String] = []
     @State private var newTagText: String = ""
@@ -3047,7 +3049,13 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
                         return false
                     }()
                     ForEach(Array(state.loadedTranscript.enumerated()), id: \.offset) { _, record in
-                        transcriptRow(record: record, isCleaning: isCleaning, showingOriginal: state.showingOriginal)
+                        transcriptRow(
+                            record: record,
+                            isCleaning: isCleaning,
+                            showingOriginal: state.showingOriginal,
+                            sessionID: selectedSession?.id,
+                            speakerNames: selectedSession?.speakerNames
+                        )
                     }
                 }
                 .padding(16)
@@ -3108,12 +3116,46 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
     }
 
     @ViewBuilder
-    private func transcriptRow(record: SessionRecord, isCleaning: Bool, showingOriginal: Bool) -> some View {
+    private func transcriptRow(record: SessionRecord, isCleaning: Bool, showingOriginal: Bool, sessionID: String? = nil, speakerNames: [String: String]? = nil) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(record.speaker.displayLabel)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(record.speaker.color)
-                .frame(minWidth: 36, alignment: .trailing)
+            let speakerKey = record.speaker.storageKey
+            let isRenameable = sessionID != nil && record.speaker.isRemote
+            let label = record.speaker.displayName(speakerNames: speakerNames)
+
+            Group {
+                if isRenameable {
+                    Button(label) {
+                        speakerRenameText = label
+                        renamingSpeakerKey = speakerKey
+                    }
+                    .buttonStyle(.plain)
+                    .popover(isPresented: Binding(
+                        get: { renamingSpeakerKey == speakerKey },
+                        set: { if !$0 { renamingSpeakerKey = nil } }
+                    )) {
+                        SpeakerRenamePopover(
+                            text: $speakerRenameText,
+                            placeholder: record.speaker.displayLabel
+                        ) {
+                            guard let sid = sessionID else { return }
+                            var names = speakerNames ?? [:]
+                            let trimmed = speakerRenameText.trimmingCharacters(in: .whitespaces)
+                            if trimmed.isEmpty || trimmed == record.speaker.displayLabel {
+                                names.removeValue(forKey: speakerKey)
+                            } else {
+                                names[speakerKey] = trimmed
+                            }
+                            controller.updateSessionSpeakerNames(sessionID: sid, speakerNames: names)
+                            renamingSpeakerKey = nil
+                        }
+                    }
+                } else {
+                    Text(label)
+                }
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(record.speaker.color)
+            .frame(minWidth: 36, alignment: .trailing)
 
             let displayText = showingOriginal ? record.text : (record.cleanedText ?? record.text)
             Text(displayText)
@@ -3431,5 +3473,40 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
         guard !trimmed.isEmpty else { return }
         controller.addManualTranscript(trimmed)
         cancelAddTranscript()
+    }
+}
+
+// MARK: - Speaker Rename Popover
+
+private struct SpeakerRenamePopover: View {
+    @Binding var text: String
+    let placeholder: String
+    let onCommit: () -> Void
+
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Rename Speaker")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 180)
+                .focused($focused)
+                .onSubmit(onCommit)
+            HStack {
+                Button("Cancel") { text = ""; onCommit() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Save") { onCommit() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
+        }
+        .padding(12)
+        .onAppear { focused = true }
     }
 }
