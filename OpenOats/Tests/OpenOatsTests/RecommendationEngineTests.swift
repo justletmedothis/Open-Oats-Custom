@@ -288,6 +288,6 @@ final class RecommendationEngineTests: XCTestCase {
             snapshot: makeSnapshot()
         )
 
-        XCTAssertTrue(recommendation.detailLines.contains(where: { $0.contains("Parakeet TDT v2") }))
+        XCTAssertTrue(recommendation.detailLines.contains(where: { $0.contains(recommendation.transcriptionModel.displayName) }))
     }
 }
