@@ -26,6 +26,7 @@ let package = Package(
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.7.0"),
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "0.9.0"),
         .package(url: "https://github.com/sindresorhus/LaunchAtLogin-Modern", from: "1.1.0"),
+        .package(url: "https://github.com/sindresorhus/KeyboardShortcuts", from: "3.0.1"),
     ],
     targets: [
         .target(
@@ -35,6 +36,7 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "WhisperKit", package: "WhisperKit"),
                 .product(name: "LaunchAtLogin", package: "LaunchAtLogin-Modern"),
+                .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
             ],
             path: "Sources/OpenOats",
             exclude: ["Info.plist", "OpenOats.entitlements", "Assets", "Resources"]

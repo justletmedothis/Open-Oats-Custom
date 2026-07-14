@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import CoreAudio
+import KeyboardShortcuts
 import LaunchAtLogin
 import ServiceManagement
 import Sparkle
@@ -260,6 +261,16 @@ private struct GeneralSettingsTab: View {
                             }
                         }
                     }
+                }
+
+                Section("Keyboard Shortcuts") {
+                    KeyboardShortcuts.Recorder("Start/stop meeting", name: .toggleMeeting)
+                        .font(.system(size: 12))
+                    KeyboardShortcuts.Recorder("Toggle suggestion panel", name: .toggleSuggestionPanel)
+                        .font(.system(size: 12))
+                    Text("These shortcuts work system-wide, even when OpenOats is in the background.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Privacy") {
