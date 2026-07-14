@@ -317,6 +317,20 @@ struct SessionRecord: Codable {
             suggestionLifecycle: suggestionLifecycle
         )
     }
+
+    func withSpeaker(_ newSpeaker: Speaker) -> SessionRecord {
+        SessionRecord(
+            speaker: newSpeaker, text: text, timestamp: timestamp,
+            suggestions: suggestions, kbHits: kbHits,
+            suggestionDecision: suggestionDecision,
+            surfacedSuggestionText: surfacedSuggestionText,
+            conversationStateSummary: conversationStateSummary,
+            cleanedText: cleanedText,
+            suggestionID: suggestionID,
+            triggerUtteranceID: triggerUtteranceID,
+            suggestionLifecycle: suggestionLifecycle
+        )
+    }
 }
 
 // MARK: - Meeting Templates & Generated Notes

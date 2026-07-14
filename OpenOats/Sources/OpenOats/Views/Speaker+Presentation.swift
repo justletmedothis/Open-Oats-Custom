@@ -10,6 +10,10 @@ extension Speaker {
             Color(red: 0.82, green: 0.6, blue: 0.3)      // warm amber
         case .remote(let n):
             Self.remoteColors[(n - 1) % Self.remoteColors.count]
+        case .local(let n):
+            // Offset into the shared palette so in-person speakers don't
+            // mirror remote speaker colors in hybrid meetings.
+            Self.remoteColors[(n + 3) % Self.remoteColors.count]
         }
     }
 

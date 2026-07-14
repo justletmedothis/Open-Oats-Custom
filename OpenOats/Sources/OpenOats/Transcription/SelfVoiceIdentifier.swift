@@ -1,0 +1,111 @@
+import FluidAudio
+import Foundation
+
+/// Matches diarized microphone voices against the user's enrolled voiceprint so
+/// their own speech can be labeled .you instead of a lettered in-person speaker.
+enum SelfVoiceIdentifier {
+    /// Cosine-distance ceiling for accepting a diarized voice as the enrolled
+    /// user. WeSpeaker distances for the same voice on the same mic typically
+    /// land well below this; unrelated voices land near or above 0.8.
+    static let maxMatchDistance: Float = 0.65
+    /// The best candidate must beat the runner-up by this margin, so two in-room
+    /// voices that both hover near the threshold never get a coin-flip match.
+    static let minRunnerUpGap: Float = 0.05
+    /// The embedding model reads at most 10 s of audio per inference.
+    static let maxClipSeconds: Double = 10.0
+    /// Speakers with less diarized audio than this are not scored.
+    static let minClipSeconds: Double = 3.0
+
+    private static let sampleRate = 16_000.0
+
+    enum EnrollmentError: LocalizedError {
+        case notEnoughSpeech
+
+        var errorDescription: String? {
+            switch self {
+            case .notEnoughSpeech:
+                "The recording did not contain enough clear speech. Try again closer to the microphone."
+            }
+        }
+    }
+
+    /// Extract an L2-normalized speaker embedding from a 16 kHz mono clip, for
+    /// enrolling the user's voice profile. Downloads the segmentation and
+    /// embedding models on first use.
+    static func extractEmbedding(from samples: [Float]) async throws -> [Float] {
+        let models = try await DiarizerModels.downloadIfNeeded()
+        let manager = DiarizerManager()
+        manager.initialize(models: models)
+        defer { manager.cleanup() }
+
+        let clip = Array(samples.prefix(Int(maxClipSeconds * sampleRate)))
+        guard manager.validateAudio(clip).isValid else {
+            throw EnrollmentError.notEnoughSpeech
+        }
+        let embedding = try manager.extractSpeakerEmbedding(from: clip)
+        guard manager.validateEmbedding(embedding) else {
+            throw EnrollmentError.notEnoughSpeech
+        }
+        return embedding
+    }
+
+    /// Returns the diarizer speaker index whose voice matches the enrolled
+    /// voiceprint, or nil when no speaker is a confident match.
+    static func matchSelf(
+        samples: [Float],
+        speakerSegments: [Int: [DiarizationManager.SpeakerSegment]],
+        voiceprint: [Float]
+    ) async throws -> Int? {
+        guard speakerSegments.count >= 2 else { return nil }
+
+        let models = try await DiarizerModels.downloadIfNeeded()
+        let manager = DiarizerManager()
+        manager.initialize(models: models)
+        defer { manager.cleanup() }
+
+        var scored: [(index: Int, distance: Float)] = []
+        for (index, segments) in speakerSegments.sorted(by: { $0.key < $1.key }) {
+            let clip = clip(from: samples, segments: segments)
+            guard Double(clip.count) / sampleRate >= minClipSeconds else {
+                Log.diarization.info("Self-voice match: speaker \(index, privacy: .public) has too little audio, skipping")
+                continue
+            }
+            let embedding = try manager.extractSpeakerEmbedding(from: clip)
+            let distance = SpeakerUtilities.cosineDistance(embedding, voiceprint)
+            guard distance.isFinite else { continue }
+            scored.append((index: index, distance: distance))
+            Log.diarization.info("Self-voice match: speaker \(index, privacy: .public) distance \(distance, privacy: .public)")
+        }
+
+        guard let best = scored.min(by: { $0.distance < $1.distance }),
+              best.distance <= maxMatchDistance
+        else { return nil }
+
+        let runnerUp = scored.filter { $0.index != best.index }.map(\.distance).min() ?? .infinity
+        guard runnerUp - best.distance >= minRunnerUpGap else {
+            Log.diarization.info("Self-voice match: runner-up too close (\(runnerUp - best.distance, privacy: .public)), not matching")
+            return nil
+        }
+        return best.index
+    }
+
+    /// Concatenate a speaker's longest diarized segments into a single clip,
+    /// capped at what the embedding model can read in one pass.
+    private static func clip(
+        from samples: [Float],
+        segments: [DiarizationManager.SpeakerSegment]
+    ) -> [Float] {
+        let maxSamples = Int(maxClipSeconds * sampleRate)
+        var clip: [Float] = []
+        clip.reserveCapacity(maxSamples)
+        for segment in segments.sorted(by: { ($0.end - $0.start) > ($1.end - $1.start) }) {
+            guard clip.count < maxSamples else { break }
+            let lower = max(0, Int(Double(segment.start) * sampleRate))
+            let upper = min(samples.count, Int(Double(segment.end) * sampleRate))
+            guard upper > lower else { continue }
+            let take = min(upper, lower + (maxSamples - clip.count))
+            clip.append(contentsOf: samples[lower..<take])
+        }
+        return clip
+    }
+}

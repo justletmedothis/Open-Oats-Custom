@@ -6,25 +6,45 @@ enum Speaker: Codable, Sendable, Hashable {
     case you
     case them
     case remote(Int)
+    /// Diarized speaker on the microphone channel (in-person participants).
+    /// Lettered labels so they never collide with numbered remote speakers.
+    case local(Int)
 
     var displayLabel: String {
         switch self {
         case .you: "You"
         case .them: "Them"
         case .remote(let n): "Speaker \(n)"
+        case .local(let n): "Speaker \(Self.letter(for: n))"
         }
+    }
+
+    /// A, B, ... Z, then AA, AB, ... for the unlikely n > 26.
+    private static func letter(for n: Int) -> String {
+        var value = max(n, 1) - 1
+        var result = ""
+        repeat {
+            result = String(UnicodeScalar(UInt8(65 + value % 26))) + result
+            value = value / 26 - 1
+        } while value >= 0
+        return result
     }
 
     func displayName(speakerNames: [String: String]?) -> String {
         speakerNames?[storageKey] ?? displayLabel
     }
 
-    /// True for any non-mic speaker (.them or .remote).
+    /// True for any system-audio speaker (.them or .remote).
     var isRemote: Bool {
         switch self {
-        case .you: false
+        case .you, .local: false
         case .them, .remote: true
         }
+    }
+
+    /// Speakers whose label is a guess the user may want to replace with a name.
+    var isRenameable: Bool {
+        self != .you
     }
 
     /// Stable key for persistence (JSONL encoding, backfill dedup).
@@ -33,6 +53,7 @@ enum Speaker: Codable, Sendable, Hashable {
         case .you: "you"
         case .them: "them"
         case .remote(let n): "remote_\(n)"
+        case .local(let n): "local_\(n)"
         }
     }
 
@@ -47,6 +68,8 @@ enum Speaker: Codable, Sendable, Hashable {
         default:
             if raw.hasPrefix("remote_"), let n = Int(raw.dropFirst("remote_".count)) {
                 self = .remote(n)
+            } else if raw.hasPrefix("local_"), let n = Int(raw.dropFirst("local_".count)) {
+                self = .local(n)
             } else {
                 self = .them
             }

@@ -2004,10 +2004,10 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
                 Divider()
 
                 Label(
-                    settings.enableDiarization
-                        ? "Speaker diarization: \(settings.diarizationVariant.displayName)"
+                    settings.enableDiarization || settings.enableMicDiarization
+                        ? "Speaker diarization: \(settings.diarizationVariant.displayName)\(settings.enableMicDiarization ? " (incl. mic)" : "")"
                         : "Speaker diarization off",
-                    systemImage: settings.enableDiarization ? "person.2" : "person.2.slash"
+                    systemImage: settings.enableDiarization || settings.enableMicDiarization ? "person.2" : "person.2.slash"
                 )
                 .foregroundStyle(.secondary)
             }
@@ -3347,7 +3347,7 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
     private func transcriptRow(record: SessionRecord, isCleaning: Bool, showingOriginal: Bool, sessionID: String? = nil, speakerNames: [String: String]? = nil) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             let speakerKey = record.speaker.storageKey
-            let isRenameable = sessionID != nil && record.speaker.isRemote
+            let isRenameable = sessionID != nil && record.speaker.isRenameable
             let label = record.speaker.displayName(speakerNames: speakerNames)
 
             Group {
