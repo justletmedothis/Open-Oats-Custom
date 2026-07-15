@@ -828,7 +828,17 @@ actor BatchAudioTranscriber {
                 for slice in slices {
                     let rangeEnd = min(segment.samples.count, slice.startSample + slice.sampleCount)
                     guard slice.startSample < rangeEnd else { continue }
-                    let sliceSamples = Array(segment.samples[slice.startSample..<rangeEnd])
+                    var sliceSamples = Array(segment.samples[slice.startSample..<rangeEnd])
+                    // Parakeet rejects clips under 1 s outright, and diarized
+                    // speaker runs (min 0.8 s) and VAD segments (min 0.5 s) can
+                    // both be shorter. Pad with trailing silence instead of
+                    // letting one short slice fail the whole batch.
+                    let minimumSampleCount = 16_000
+                    if sliceSamples.count < minimumSampleCount {
+                        sliceSamples.append(
+                            contentsOf: [Float](repeating: 0, count: minimumSampleCount - sliceSamples.count)
+                        )
+                    }
                     let text = try await backend.transcribe(sliceSamples, locale: locale, previousContext: nil)
                     guard !text.isEmpty else { continue }
 
