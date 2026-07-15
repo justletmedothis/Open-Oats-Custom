@@ -161,6 +161,11 @@ final class TranscriptionEngine {
     private let mode: Mode
 
     /// Combined audio level (mic + system) for the UI meter.
+    /// Per-channel levels for live-lag detection: a channel with audible
+    /// speech whose transcript side has stalled means live ASR is behind.
+    nonisolated var micAudioLevel: Float { micCapture.audioLevel }
+    nonisolated var systemAudioLevel: Float { systemCapture.audioLevel }
+
     /// nonisolated is safe here — both audioLevel properties are thread-safe (NSLock).
     nonisolated var audioLevel: Float {
         switch mode {

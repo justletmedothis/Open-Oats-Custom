@@ -349,6 +349,10 @@ final class LiveSessionController {
         container.ensureMeetingServicesInitialized(settings: settings, coordinator: coordinator)
         coordinator.suggestionEngine?.clear()
         coordinator.sidecastEngine?.clear()
+        // Auto-started sessions can begin inside the idle polling gap, so an
+        // idle tick isn't guaranteed to have reset these between sessions.
+        micLagTracker.reset()
+        sysLagTracker.reset()
         let calEvent = calendarEventOverride ?? (settings.calendarIntegrationEnabled
             ? container.calendarManager?.currentEvent(
                 excludingCalendarIDs: settings.excludedCalendarIDs
@@ -1455,6 +1459,90 @@ final class LiveSessionController {
         }
     }
 
+    // MARK: - Live Transcription Lag Detection
+
+    /// Detects a live channel that is audibly active while its side of the
+    /// transcript has stopped progressing — the signature of live ASR falling
+    /// behind under load. The recorded audio is unaffected (the batch pass
+    /// rebuilds the transcript from it), so this only drives a notice.
+    struct ChannelLagTracker {
+        static let speechLevel: Float = 0.15
+        static let stallSeconds: TimeInterval = 15
+        /// Cumulative audible time required since the last progress before a
+        /// stall counts as lag — a single chime or brief noise must not latch
+        /// the notice on.
+        static let minVoicedSeconds: TimeInterval = 2.5
+
+        private var progressCount = -1
+        private var volatileSnapshot = ""
+        private var lastProgressAt: Date?
+        private var lastVoiceAt: Date?
+        private var voicedSecondsSinceProgress: TimeInterval = 0
+        private var lastSampleAt: Date?
+
+        mutating func reset() {
+            progressCount = -1
+            volatileSnapshot = ""
+            lastProgressAt = nil
+            lastVoiceAt = nil
+            voicedSecondsSinceProgress = 0
+            lastSampleAt = nil
+        }
+
+        mutating func isLagging(now: Date, level: Float, progress: Int, volatileText: String) -> Bool {
+            let elapsed = lastSampleAt.map { min(now.timeIntervalSince($0), 1.0) } ?? 0
+            lastSampleAt = now
+            if lastProgressAt == nil { lastProgressAt = now }
+            if progress != progressCount || volatileText != volatileSnapshot {
+                progressCount = progress
+                volatileSnapshot = volatileText
+                lastProgressAt = now
+                voicedSecondsSinceProgress = 0
+            }
+            if level >= Self.speechLevel {
+                lastVoiceAt = now
+                voicedSecondsSinceProgress += elapsed
+            }
+            guard let progressAt = lastProgressAt, let voiceAt = lastVoiceAt else { return false }
+            // Sustained speech with no progress, and the channel is still
+            // audible recently — decays once the room goes quiet.
+            return voicedSecondsSinceProgress >= Self.minVoicedSeconds
+                && now.timeIntervalSince(voiceAt) <= Self.stallSeconds
+                && now.timeIntervalSince(progressAt) > Self.stallSeconds
+        }
+    }
+
+    private var micLagTracker = ChannelLagTracker()
+    private var sysLagTracker = ChannelLagTracker()
+
+    static let liveTranscriptLagNotice =
+        "Live transcription is falling behind. The full transcript is rebuilt automatically after the meeting."
+
+    @MainActor
+    private func liveLagNotice(isRunning: Bool, transcript: [Utterance]) -> String? {
+        guard isRunning, let engine = coordinator.transcriptionEngine else {
+            micLagTracker.reset()
+            sysLagTracker.reset()
+            return nil
+        }
+        let now = Date()
+        var remoteCount = 0
+        for utterance in transcript where utterance.speaker.isRemote { remoteCount += 1 }
+        let micLagging = micLagTracker.isLagging(
+            now: now,
+            level: engine.micAudioLevel,
+            progress: transcript.count - remoteCount,
+            volatileText: coordinator.transcriptStore.volatileYouText
+        )
+        let sysLagging = sysLagTracker.isLagging(
+            now: now,
+            level: engine.systemAudioLevel,
+            progress: remoteCount,
+            volatileText: coordinator.transcriptStore.volatileThemText
+        )
+        return micLagging || sysLagging ? Self.liveTranscriptLagNotice : nil
+    }
+
     @MainActor
     private func refreshState(settings: AppSettings) {
         let lastEndedSession = coordinator.lastEndedSession
@@ -1525,7 +1613,11 @@ final class LiveSessionController {
         set(\.transcriptionPrompt, settings.transcriptionModel.downloadPrompt)
         set(\.modelDisplayName, activeModelRaw.split(separator: "/").last.map(String.init) ?? activeModelRaw)
         set(\.showLiveTranscript, settings.showLiveTranscript)
-        set(\.liveTranscriptNotice, isRunning ? Self.liveTranscriptNotice(for: activeTranscriptionModel, issue: liveCloudIssue, isProcessing: liveCloudIsProcessing) : nil)
+        let nextTranscript = coordinator.transcriptStore.utterances
+        let baseNotice = isRunning
+            ? Self.liveTranscriptNotice(for: activeTranscriptionModel, issue: liveCloudIssue, isProcessing: liveCloudIsProcessing)
+            : nil
+        set(\.liveTranscriptNotice, baseNotice ?? liveLagNotice(isRunning: isRunning, transcript: nextTranscript))
         set(\.liveTranscriptEmptyStateMessage, isRunning ? Self.liveTranscriptEmptyStateMessage(for: activeTranscriptionModel, issue: liveCloudIssue, isProcessing: liveCloudIsProcessing) : nil)
         set(\.isMicMuted, coordinator.transcriptionEngine?.isMicMuted ?? false)
         set(\.isRecordingPaused, coordinator.transcriptionEngine?.isRecordingPaused ?? false)
@@ -1537,7 +1629,6 @@ final class LiveSessionController {
         }
 
         // Arrays: compare by ID before assigning — array assignment always fires observation.
-        let nextTranscript = coordinator.transcriptStore.utterances
         if state.liveTranscript != nextTranscript {
             state.liveTranscript = nextTranscript
         }

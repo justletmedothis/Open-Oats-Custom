@@ -604,6 +604,10 @@ actor SessionRepository {
             } else {
                 transcriptRecovery = nil
             }
+            // Re-diarization reassigns lettered (local_*) speakers, so renames
+            // keyed to them could attach to a different voice; drop those and
+            // keep the stable you/them renames.
+            let carriedSpeakerNames = meta.speakerNames?.filter { !$0.key.hasPrefix("local_") }
             let refreshedMeta = SessionMetadata(
                 id: meta.id,
                 startedAt: records.first?.timestamp ?? meta.startedAt,
@@ -620,7 +624,9 @@ actor SessionRepository {
                 source: meta.source,
                 calendarEvent: meta.calendarEvent,
                 transcriptIssue: nil,
-                transcriptRecovery: transcriptRecovery
+                transcriptRecovery: transcriptRecovery,
+                customNotesGuidance: meta.customNotesGuidance,
+                speakerNames: (carriedSpeakerNames?.isEmpty ?? true) ? nil : carriedSpeakerNames
             )
             writeSessionMetadata(refreshedMeta, sessionID: sessionID)
         }

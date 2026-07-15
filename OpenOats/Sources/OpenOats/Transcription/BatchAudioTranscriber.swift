@@ -576,9 +576,12 @@ actor BatchAudioTranscriber {
             }
         }
 
+        var micSelfIndex: Int?
+        var micSpeakerSegments: [Int: [DiarizationManager.SpeakerSegment]]?
+        var sysSpeechRanges: [(start: Date, end: Date)] = []
+
         if let micURL = urls.mic {
             var micDiarizer: DiarizationManager?
-            var micSelfIndex: Int?
             if needsLSEENDForMic, let dm = batchDiarizer {
                 Log.batchTranscription.info("Running LS-EEND diarization on microphone audio...")
                 let samples = try BatchAudioSampleReader.readAll(
@@ -589,13 +592,14 @@ actor BatchAudioTranscriber {
                 try await dm.feedAudio(samples)
                 await dm.finalize()
                 micDiarizer = dm
+                let segments = await dm.speakerSegments()
+                micSpeakerSegments = segments
                 Log.batchTranscription.info("Microphone diarization complete")
 
                 // Match the enrolled voiceprint against the diarized speakers now,
                 // while the decoded samples are still in memory (before the ASR
                 // pass extends their lifetime).
                 if let profile = VoiceprintStore.load() {
-                    let segments = await dm.speakerSegments()
                     if segments.count >= 2 {
                         do {
                             micSelfIndex = try await SelfVoiceIdentifier.matchSelf(
@@ -631,10 +635,6 @@ actor BatchAudioTranscriber {
             )
             filesProcessed += 1
             Log.batchTranscription.debug("Mic transcription: \(micRecords.count, privacy: .public) records")
-
-            if let selfIndex = micSelfIndex {
-                micRecords = Self.relabelSelfSpeaker(in: micRecords, selfIndex: selfIndex)
-            }
 
             // Clear mic timeline before the diarizer is reused for system audio.
             if micDiarizer != nil {
@@ -673,12 +673,59 @@ actor BatchAudioTranscriber {
                 progressBase: Double(filesProcessed) / Double(totalFiles),
                 progressScale: 1.0 / Double(totalFiles),
                 diarizationManager: sysDiarizer,
-                useElevenLabsNativeDiarization: useElevenLabsNativeDiarization
+                useElevenLabsNativeDiarization: useElevenLabsNativeDiarization,
+                onSpeechSegment: { start, duration in
+                    sysSpeechRanges.append((start: start, end: start.addingTimeInterval(duration)))
+                }
             )
             Log.batchTranscription.debug("Sys transcription: \(sysRecords.count, privacy: .public) records")
         }
 
         try Task.checkCancellation()
+
+        // A diarized mic voice whose speaking time mostly coincides with
+        // call-audio speech is the far side leaking out of the speakers into
+        // the mic (AEC is disabled while the system tap runs). Those words are
+        // already on the system channel as "them"; the mic copy is a duplicate,
+        // not a participant.
+        if let segments = micSpeakerSegments,
+           let micStart = anchors?.micStartDate,
+           anchors?.sysStartDate != nil,   // both channels need real time anchors to compare
+           !sysSpeechRanges.isEmpty {
+            let echoIndices = Self.callEchoSpeakerIndices(
+                micSpeakerSegments: segments,
+                micStartDate: micStart,
+                sysSpeechRanges: sysSpeechRanges,
+                excluding: micSelfIndex
+            )
+            if !echoIndices.isEmpty {
+                let before = micRecords.count
+                if segments.count == 1, micSelfIndex == nil {
+                    // A single diarized mic voice is labeled .you throughout
+                    // (single-voice collapse), so there are no lettered records
+                    // to drop. If that lone voice is mostly concurrent with
+                    // call audio it is the far side over the speakers, not the
+                    // user: drop the mic records that start inside call-audio
+                    // speech. A genuinely talking user pushes the overlap
+                    // below the gate's threshold and never reaches here.
+                    micRecords.removeAll { record in
+                        sysSpeechRanges.contains { range in
+                            record.timestamp >= range.start.addingTimeInterval(-0.3)
+                                && record.timestamp <= range.end.addingTimeInterval(0.3)
+                        }
+                    }
+                } else {
+                    let echoSpeakers = Set(echoIndices.map { Speaker.local($0 + 1) })
+                    micRecords.removeAll { echoSpeakers.contains($0.speaker) }
+                }
+                Log.batchTranscription.info("Dropped \(before - micRecords.count, privacy: .public) mic records from \(echoIndices.count, privacy: .public) diarized voice(s) identified as call-audio echo")
+            }
+        }
+        if let selfIndex = micSelfIndex {
+            micRecords = Self.relabelSelfSpeaker(in: micRecords, selfIndex: selfIndex)
+        } else {
+            micRecords = Self.reletterLocalSpeakers(in: micRecords)
+        }
 
         // Apply echo suppression
         AcousticEchoFilter.suppress(micRecords: &micRecords, against: sysRecords)
@@ -741,7 +788,8 @@ actor BatchAudioTranscriber {
         progressScale: Double,
         diarizationManager: DiarizationManager? = nil,
         diarizationChannel: DiarizationManager.Channel = .system,
-        useElevenLabsNativeDiarization: Bool = false
+        useElevenLabsNativeDiarization: Bool = false,
+        onSpeechSegment: ((Date, TimeInterval) -> Void)? = nil
     ) async throws -> [SessionRecord] {
         guard let audioFile = try? AVAudioFile(forReading: url) else {
             Log.batchTranscription.warning("Cannot open audio file: \(url.lastPathComponent, privacy: .public)")
@@ -785,6 +833,7 @@ actor BatchAudioTranscriber {
                 let segmentStartTime = sampleOffsetInFile / resolvedSampleRate
                 let segmentDuration = Double(segment.samples.count) / 16000.0
                 let segmentEndTime = segmentStartTime + segmentDuration
+                onSpeechSegment?(resolvedStartDate.addingTimeInterval(segmentStartTime), segmentDuration)
 
                 if useElevenLabsNativeDiarization,
                    let elevenLabsBackend = backend as? ElevenLabsScribeBackend
@@ -919,6 +968,69 @@ actor BatchAudioTranscriber {
             guard let mapped = mapping[record.speaker], mapped != record.speaker else { return record }
             return record.withSpeaker(mapped)
         }
+    }
+
+    /// Reletter surviving .local speakers contiguously (Speaker A, B, ...)
+    /// after echo removal, so the first guest is always Speaker A.
+    static func reletterLocalSpeakers(in records: [SessionRecord]) -> [SessionRecord] {
+        let remaining = Set(
+            records.compactMap { record -> Int? in
+                guard case .local(let n) = record.speaker else { return nil }
+                return n
+            }
+        ).sorted()
+
+        var mapping: [Speaker: Speaker] = [:]
+        for (offset, n) in remaining.enumerated() where n != offset + 1 {
+            mapping[.local(n)] = .local(offset + 1)
+        }
+        guard !mapping.isEmpty else { return records }
+
+        return records.map { record in
+            guard let mapped = mapping[record.speaker] else { return record }
+            return record.withSpeaker(mapped)
+        }
+    }
+
+    /// Indices of diarized mic speakers whose speech overlaps call-audio
+    /// speech for at least half their total speaking time. The far side of a
+    /// call playing over the speakers reaches the mic almost exclusively while
+    /// the system channel also has speech; a person in the room does not.
+    static func callEchoSpeakerIndices(
+        micSpeakerSegments: [Int: [DiarizationManager.SpeakerSegment]],
+        micStartDate: Date,
+        sysSpeechRanges: [(start: Date, end: Date)],
+        excluding selfIndex: Int?
+    ) -> [Int] {
+        let overlapThreshold = 0.5
+        // Absorbs channel anchor drift and speaker-to-mic propagation delay.
+        let tolerance: TimeInterval = 0.3
+
+        var echoes: [Int] = []
+        for (index, segments) in micSpeakerSegments {
+            if index == selfIndex { continue }
+            var total: TimeInterval = 0
+            var overlap: TimeInterval = 0
+            for segment in segments {
+                let duration = TimeInterval(segment.end - segment.start)
+                guard duration > 0 else { continue }
+                total += duration
+                let start = micStartDate.addingTimeInterval(TimeInterval(segment.start))
+                let end = micStartDate.addingTimeInterval(TimeInterval(segment.end))
+                for range in sysSpeechRanges {
+                    let overlapStart = max(start, range.start.addingTimeInterval(-tolerance))
+                    let overlapEnd = min(end, range.end.addingTimeInterval(tolerance))
+                    if overlapEnd > overlapStart {
+                        overlap += overlapEnd.timeIntervalSince(overlapStart)
+                    }
+                }
+            }
+            guard total > 0 else { continue }
+            if overlap / total >= overlapThreshold {
+                echoes.append(index)
+            }
+        }
+        return echoes.sorted()
     }
 
     // MARK: - Audio Reading
