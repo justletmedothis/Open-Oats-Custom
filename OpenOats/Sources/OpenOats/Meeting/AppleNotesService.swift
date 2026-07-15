@@ -55,7 +55,7 @@ enum AppleNotesService {
         let html = buildHTML(
             title: title,
             notesMarkdown: notesMarkdown,
-            transcriptEntries: transcriptEntries(from: utterances),
+            transcriptEntries: transcriptEntries(from: utterances, speakerNames: sessionIndex.speakerNames),
             includeTranscript: settings.appleNotesIncludeTranscript
         )
         Task {
@@ -86,7 +86,7 @@ enum AppleNotesService {
         let html = buildHTML(
             title: title,
             notesMarkdown: notesMarkdown,
-            transcriptEntries: transcriptEntries(from: records),
+            transcriptEntries: transcriptEntries(from: records, speakerNames: sessionIndex.speakerNames),
             includeTranscript: settings.appleNotesIncludeTranscript
         )
         let existingNoteID = storedNoteID(for: sessionIndex.id)
@@ -210,12 +210,12 @@ enum AppleNotesService {
         let timestamp: Date
     }
 
-    private static func transcriptEntries(from utterances: [Utterance]) -> [TranscriptEntry] {
-        utterances.map { TranscriptEntry(speaker: $0.speaker.displayLabel, text: $0.cleanedText ?? $0.text, timestamp: $0.timestamp) }
+    private static func transcriptEntries(from utterances: [Utterance], speakerNames: [String: String]?) -> [TranscriptEntry] {
+        utterances.map { TranscriptEntry(speaker: $0.speaker.displayName(speakerNames: speakerNames), text: $0.cleanedText ?? $0.text, timestamp: $0.timestamp) }
     }
 
-    private static func transcriptEntries(from records: [SessionRecord]) -> [TranscriptEntry] {
-        records.map { TranscriptEntry(speaker: $0.speaker.displayLabel, text: $0.cleanedText ?? $0.text, timestamp: $0.timestamp) }
+    private static func transcriptEntries(from records: [SessionRecord], speakerNames: [String: String]?) -> [TranscriptEntry] {
+        records.map { TranscriptEntry(speaker: $0.speaker.displayName(speakerNames: speakerNames), text: $0.cleanedText ?? $0.text, timestamp: $0.timestamp) }
     }
 
     private static func buildHTML(

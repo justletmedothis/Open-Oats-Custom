@@ -806,6 +806,17 @@ final class SettingsStore {
         }
     }
 
+    @ObservationIgnored nonisolated(unsafe) private var _enableMicDiarization: Bool
+    var enableMicDiarization: Bool {
+        get { access(keyPath: \.enableMicDiarization); return _enableMicDiarization }
+        set {
+            withMutation(keyPath: \.enableMicDiarization) {
+                _enableMicDiarization = newValue
+                defaults.set(newValue, forKey: "enableMicDiarization")
+            }
+        }
+    }
+
     @ObservationIgnored nonisolated(unsafe) private var _diarizationVariant: String
     var diarizationVariant: DiarizationVariant {
         get { access(keyPath: \.diarizationVariant); return DiarizationVariant(rawValue: _diarizationVariant) ?? .dihard3 }
@@ -1511,6 +1522,7 @@ final class SettingsStore {
             rawValue: defaults.string(forKey: "batchTranscriptionModel") ?? ""
         ) ?? .whisperLargeV3Turbo
         self._enableDiarization = defaults.bool(forKey: "enableDiarization")
+        self._enableMicDiarization = defaults.bool(forKey: "enableMicDiarization")
         self._diarizationVariant = defaults.string(forKey: "diarizationVariant") ?? DiarizationVariant.dihard3.rawValue
 
         // Detection Settings

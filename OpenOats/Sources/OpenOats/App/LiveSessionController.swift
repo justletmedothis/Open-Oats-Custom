@@ -1036,6 +1036,7 @@ final class LiveSessionController {
             let notesDir = URL(fileURLWithPath: settings.notesFolderPath)
             let repo = coordinator.sessionRepository
             let diarize = settings.enableDiarization
+            let diarizeMic = settings.enableMicDiarization
             let diarizeVariant = settings.diarizationVariant
             Task.detached { [batchAudioTranscriber] in
                 await batchAudioTranscriber.process(
@@ -1045,6 +1046,7 @@ final class LiveSessionController {
                     sessionRepository: repo,
                     notesDirectory: notesDir,
                     enableDiarization: diarize,
+                    enableMicDiarization: diarizeMic,
                     diarizationVariant: diarizeVariant
                 )
             }
@@ -1124,6 +1126,7 @@ final class LiveSessionController {
         do {
             let generatedMarkdown = try await coordinator.notesEngine.generateMarkdownDetached(
                 transcript: sessionData.transcript,
+                speakerNames: session.speakerNames,
                 template: template,
                 settings: settings,
                 calendarEvent: sessionData.calendarEvent,

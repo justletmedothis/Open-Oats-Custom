@@ -540,6 +540,7 @@ final class NotesController {
         let capturedTranscript = state.loadedTranscript
         let capturedCalendarEvent = state.loadedCalendarEvent
         let capturedGuidance = state.customNotesGuidance
+        let capturedSpeakerNames = state.sessionHistory.first(where: { $0.id == sessionID })?.speakerNames
 
         generatingSessionID = sessionID
         cancelledGenerationSessionIDs.remove(sessionID)
@@ -551,6 +552,7 @@ final class NotesController {
 
             coordinator.notesEngine.generate(
                 transcript: capturedTranscript,
+                speakerNames: capturedSpeakerNames,
                 template: template,
                 settings: settings,
                 calendarEvent: capturedCalendarEvent,
@@ -872,6 +874,7 @@ final class NotesController {
                 sessionRepository: coordinator.sessionRepository,
                 notesDirectory: notesDirectory,
                 enableDiarization: settings.enableDiarization,
+                enableMicDiarization: settings.enableMicDiarization,
                 diarizationVariant: settings.diarizationVariant
             )
             pendingAutoNotes = (sessionID: sessionID, settings: settings)
@@ -1772,6 +1775,19 @@ private enum ManualTranscriptImporter {
         if normalized.hasPrefix("speaker "),
            let number = Int(normalized.dropFirst("speaker ".count)) {
             return .remote(number)
+        }
+
+        // Lettered labels are in-person (mic-diarized) speakers: A → local(1).
+        if normalized.hasPrefix("speaker ") {
+            let suffix = normalized.dropFirst("speaker ".count)
+            if !suffix.isEmpty, suffix.allSatisfy({ $0.isLetter }), suffix.count <= 2 {
+                var value = 0
+                for scalar in suffix.unicodeScalars {
+                    guard scalar.value >= 97, scalar.value <= 122 else { return nil }
+                    value = value * 26 + Int(scalar.value - 96)
+                }
+                return .local(value)
+            }
         }
 
         if normalized.hasPrefix("remote "),

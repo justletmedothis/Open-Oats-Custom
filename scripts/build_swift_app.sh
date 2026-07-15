@@ -103,6 +103,15 @@ while IFS= read -r -d '' bundle; do
   destination="$APP_DIR/Contents/Resources/$bundle_name"
   rm -rf "$destination"
   cp -R "$bundle" "$destination"
+  # swift build's generated Bundle.module accessor only checks the .app ROOT
+  # (Bundle.main.bundleURL) and the absolute .build path baked in at compile
+  # time. Contents/Resources alone is NOT enough: if .build moves or is
+  # cleaned, Bundle.module fatalErrors at runtime (KeyboardShortcuts crashes
+  # Settings this way). Ship a copy at the bundle root so the app is
+  # self-contained. Note: root-level files break identity codesigning; if we
+  # ever sign these builds, this needs a different approach.
+  rm -rf "$APP_DIR/$bundle_name"
+  cp -R "$bundle" "$APP_DIR/$bundle_name"
   COPIED_BUNDLES=$((COPIED_BUNDLES + 1))
 done < <(find "$SWIFT_DIR/.build" -path "*/release/*.bundle" -type d -print0)
 if [[ $COPIED_BUNDLES -gt 0 ]]; then

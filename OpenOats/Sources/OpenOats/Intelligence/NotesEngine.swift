@@ -50,6 +50,7 @@ final class NotesEngine {
 
     func generateMarkdownDetached(
         transcript: [SessionRecord],
+        speakerNames: [String: String]? = nil,
         template: MeetingTemplate,
         settings: AppSettings,
         calendarEvent: CalendarEvent? = nil,
@@ -59,6 +60,7 @@ final class NotesEngine {
         let detachedEngine = NotesEngine(mode: mode)
         return try await detachedEngine.awaitGeneratedMarkdown(
             transcript: transcript,
+            speakerNames: speakerNames,
             template: template,
             settings: settings,
             calendarEvent: calendarEvent,
@@ -71,6 +73,7 @@ final class NotesEngine {
     /// Returns immediately — generation runs in the background. Call `onFinished` to react when done.
     func generate(
         transcript: [SessionRecord],
+        speakerNames: [String: String]? = nil,
         template: MeetingTemplate,
         settings: AppSettings,
         calendarEvent: CalendarEvent? = nil,
@@ -204,6 +207,7 @@ final class NotesEngine {
         )
         let userContent = Self.buildUserContent(
             transcript: transcript,
+            speakerNames: speakerNames,
             calendarEvent: includeCalendarContext ? calendarEvent : nil,
             scratchpad: scratchpad,
             customGuidance: customGuidance
@@ -256,6 +260,7 @@ final class NotesEngine {
 
     private func awaitGeneratedMarkdown(
         transcript: [SessionRecord],
+        speakerNames: [String: String]? = nil,
         template: MeetingTemplate,
         settings: AppSettings,
         calendarEvent: CalendarEvent? = nil,
@@ -265,6 +270,7 @@ final class NotesEngine {
         try await withCheckedThrowingContinuation { continuation in
             generate(
                 transcript: transcript,
+                speakerNames: speakerNames,
                 template: template,
                 settings: settings,
                 calendarEvent: calendarEvent,
@@ -286,6 +292,7 @@ final class NotesEngine {
 
     nonisolated static func buildUserContent(
         transcript: [SessionRecord],
+        speakerNames: [String: String]? = nil,
         calendarEvent: CalendarEvent? = nil,
         scratchpad: String? = nil,
         customGuidance: String? = nil
@@ -304,7 +311,7 @@ final class NotesEngine {
             )
         }
 
-        sections.append("Here is the meeting transcript:\n\n\(formatTranscript(transcript))")
+        sections.append("Here is the meeting transcript:\n\n\(formatTranscript(transcript, speakerNames: speakerNames))")
 
         if let scratchpad, !scratchpad.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             sections.append(
@@ -363,7 +370,10 @@ final class NotesEngine {
         """
     }
 
-    private nonisolated static func formatTranscript(_ records: [SessionRecord]) -> String {
+    private nonisolated static func formatTranscript(
+        _ records: [SessionRecord],
+        speakerNames: [String: String]? = nil
+    ) -> String {
         let timeFmt = DateFormatter()
         timeFmt.dateFormat = "HH:mm:ss"
 
@@ -372,7 +382,7 @@ final class NotesEngine {
         let maxChars = 60_000
 
         for record in records {
-            let label = record.speaker.displayLabel
+            let label = record.speaker.displayName(speakerNames: speakerNames)
             let bestText = record.cleanedText ?? record.text
             let line = "[\(timeFmt.string(from: record.timestamp))] \(label): \(bestText)"
             totalChars += line.count

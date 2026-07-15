@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import CoreAudio
+import KeyboardShortcuts
 import LaunchAtLogin
 import ServiceManagement
 import Sparkle
@@ -262,6 +263,16 @@ private struct GeneralSettingsTab: View {
                     }
                 }
 
+                Section("Keyboard Shortcuts") {
+                    KeyboardShortcuts.Recorder("Start/stop meeting", name: .toggleMeeting)
+                        .font(.system(size: 12))
+                    KeyboardShortcuts.Recorder("Toggle suggestion panel", name: .toggleSuggestionPanel)
+                        .font(.system(size: 12))
+                    Text("These shortcuts work system-wide, even when OpenOats is in the background.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Privacy") {
                     Toggle("Hide from screen sharing", isOn: $settings.hideFromScreenShare)
                         .font(.system(size: 12))
@@ -385,6 +396,7 @@ private struct TranscriptionSettingsTab: View {
     @State private var isValidatingCohereKey = false
     @State private var cohereValidation: APIKeyValidator.ValidationResult?
     @State private var cohereValidationTask: Task<Void, Never>?
+    @State private var voiceEnrollment = VoiceEnrollmentController()
 
     var body: some View {
         ScrollView {
@@ -601,7 +613,17 @@ private struct TranscriptionSettingsTab: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
 
-                    if settings.enableDiarization {
+                    Toggle("Identify multiple in-person speakers", isOn: $settings.enableMicDiarization)
+                        .font(.system(size: 12))
+                    Text("Runs the same diarization on microphone audio during post-meeting re-transcription, for in-person and conference-room meetings. In-person voices are labeled Speaker A, B, C; rename them in the transcript. Requires \"Re-transcribe with higher accuracy after meeting\".")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+
+                    if settings.enableMicDiarization {
+                        voiceProfileRow
+                    }
+
+                    if settings.enableDiarization || settings.enableMicDiarization {
                         Picker("Variant", selection: $settings.diarizationVariant) {
                             ForEach(DiarizationVariant.allCases) { variant in
                                 Text(variant.displayName).tag(variant)
@@ -633,7 +655,64 @@ private struct TranscriptionSettingsTab: View {
         .onDisappear {
             cancelElevenLabsValidation()
             cancelCohereValidation()
+            voiceEnrollment.cancelRecording()
         }
+    }
+
+    @ViewBuilder
+    private var voiceProfileRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            switch voiceEnrollment.phase {
+            case .recording(let secondsRemaining):
+                HStack {
+                    Label("Recording... speak normally (\(secondsRemaining)s left)", systemImage: "waveform")
+                        .font(.system(size: 12))
+                    Spacer()
+                    Button("Cancel") { voiceEnrollment.cancelRecording() }
+                        .font(.system(size: 12))
+                }
+            case .processing:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Creating voice profile...")
+                        .font(.system(size: 12))
+                }
+            case .idle, .failed:
+                HStack {
+                    if let profile = voiceEnrollment.profile {
+                        Text("My voice: profile saved \(profile.createdAt.formatted(date: .abbreviated, time: .omitted))")
+                            .font(.system(size: 12))
+                        Spacer()
+                        Button("Re-record") { startVoiceEnrollment() }
+                            .font(.system(size: 12))
+                        Button("Remove") { voiceEnrollment.deleteProfile() }
+                            .font(.system(size: 12))
+                    } else {
+                        Text("My voice: not set up")
+                            .font(.system(size: 12))
+                        Spacer()
+                        Button("Record voice profile") { startVoiceEnrollment() }
+                            .font(.system(size: 12))
+                    }
+                }
+                if case .failed(let message) = voiceEnrollment.phase {
+                    Text(message)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.red)
+                }
+            }
+
+            Text("Records a 10-second sample of your voice so in-person meetings label you as You automatically instead of a lettered speaker. The profile stays on this Mac. First setup downloads a small speaker model.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func startVoiceEnrollment() {
+        voiceEnrollment.startRecording(
+            inputDeviceID: settings.inputDeviceID > 0 ? settings.inputDeviceID : nil
+        )
     }
 
     @ViewBuilder

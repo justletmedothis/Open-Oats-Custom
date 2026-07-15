@@ -308,6 +308,7 @@ actor BatchAudioTranscriber {
         sessionRepository: SessionRepository,
         notesDirectory: URL,
         enableDiarization: Bool = false,
+        enableMicDiarization: Bool = false,
         diarizationVariant: DiarizationVariant = .dihard3
     ) async {
         // Cancel any existing task
@@ -325,6 +326,7 @@ actor BatchAudioTranscriber {
                     sessionRepository: sessionRepository,
                     notesDirectory: notesDirectory,
                     enableDiarization: enableDiarization,
+                    enableMicDiarization: enableMicDiarization,
                     diarizationVariant: diarizationVariant
                 )
             } catch is CancellationError {
@@ -504,6 +506,7 @@ actor BatchAudioTranscriber {
         sessionRepository: SessionRepository,
         notesDirectory: URL,
         enableDiarization: Bool,
+        enableMicDiarization: Bool,
         diarizationVariant: DiarizationVariant
     ) async throws {
         Log.batchTranscription.info("Starting batch transcription for \(sessionID, privacy: .public) with \(model.rawValue, privacy: .public)")
@@ -544,7 +547,74 @@ actor BatchAudioTranscriber {
         let totalFiles = (urls.mic != nil ? 1 : 0) + (urls.sys != nil ? 1 : 0)
         var filesProcessed = 0
 
+        // One shared LS-EEND diarizer serves both channels sequentially
+        // (reset between files) so only a single model stays in memory.
+        let useElevenLabsNativeDiarization = enableDiarization && model == .elevenLabsScribe
+        // Scribe's native diarization numbers speakers per API call, and the
+        // mic channel is transcribed one VAD segment per call: letters would
+        // not be stable across segments, and segments with a single talker
+        // would collapse to "you" regardless of who spoke. The mic channel
+        // therefore always uses LS-EEND (whole-file context, and required for
+        // voiceprint self-identification); Scribe native diarization remains
+        // in use for system audio only.
+        let needsLSEENDForMic = enableMicDiarization && urls.mic != nil
+        let needsLSEENDForSys = enableDiarization && !useElevenLabsNativeDiarization && urls.sys != nil
+        var batchDiarizer: DiarizationManager?
+        if needsLSEENDForMic || needsLSEENDForSys {
+            do {
+                let dm = DiarizationManager()
+                let variant = LSEENDVariant(rawValue: diarizationVariant.rawValue) ?? .dihard3
+                try await dm.load(variant: variant)
+                batchDiarizer = dm
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Diarization is an enhancement: a missing or undownloadable
+                // model (e.g. first run while offline) must not sink the
+                // whole re-transcription.
+                Log.batchTranscription.warning("Speaker diarization unavailable, continuing without it: \(error, privacy: .public)")
+            }
+        }
+
         if let micURL = urls.mic {
+            var micDiarizer: DiarizationManager?
+            var micSelfIndex: Int?
+            if needsLSEENDForMic, let dm = batchDiarizer {
+                Log.batchTranscription.info("Running LS-EEND diarization on microphone audio...")
+                let samples = try BatchAudioSampleReader.readAll(
+                    url: micURL,
+                    targetRate: 16000,
+                    overrideSampleRate: anchors?.micSampleRate
+                )
+                try await dm.feedAudio(samples)
+                await dm.finalize()
+                micDiarizer = dm
+                Log.batchTranscription.info("Microphone diarization complete")
+
+                // Match the enrolled voiceprint against the diarized speakers now,
+                // while the decoded samples are still in memory (before the ASR
+                // pass extends their lifetime).
+                if let profile = VoiceprintStore.load() {
+                    let segments = await dm.speakerSegments()
+                    if segments.count >= 2 {
+                        do {
+                            micSelfIndex = try await SelfVoiceIdentifier.matchSelf(
+                                samples: samples,
+                                speakerSegments: segments,
+                                voiceprint: profile.embedding
+                            )
+                            if let index = micSelfIndex {
+                                Log.batchTranscription.info("Enrolled voice matched diarized mic speaker \(index, privacy: .public)")
+                            } else {
+                                Log.batchTranscription.info("No diarized mic speaker matched the enrolled voice profile")
+                            }
+                        } catch {
+                            Log.batchTranscription.warning("Self-voice identification failed: \(error, privacy: .public)")
+                        }
+                    }
+                }
+            }
+
             micRecords = try await transcribeFile(
                 url: micURL,
                 speaker: .you,
@@ -554,23 +624,30 @@ actor BatchAudioTranscriber {
                 vad: vad,
                 locale: locale,
                 progressBase: 0,
-                progressScale: 1.0 / Double(totalFiles)
+                progressScale: 1.0 / Double(totalFiles),
+                diarizationManager: micDiarizer,
+                diarizationChannel: .microphone,
+                useElevenLabsNativeDiarization: false
             )
             filesProcessed += 1
             Log.batchTranscription.debug("Mic transcription: \(micRecords.count, privacy: .public) records")
+
+            if let selfIndex = micSelfIndex {
+                micRecords = Self.relabelSelfSpeaker(in: micRecords, selfIndex: selfIndex)
+            }
+
+            // Clear mic timeline before the diarizer is reused for system audio.
+            if micDiarizer != nil {
+                await batchDiarizer?.reset()
+            }
         }
 
         try Task.checkCancellation()
 
         if let sysURL = urls.sys {
-            // Optionally run diarization on the full system audio
-            var batchDiarizer: DiarizationManager?
-            let useElevenLabsNativeDiarization = enableDiarization && model == .elevenLabsScribe
-            if enableDiarization && !useElevenLabsNativeDiarization {
+            var sysDiarizer: DiarizationManager?
+            if needsLSEENDForSys, let dm = batchDiarizer {
                 Log.batchTranscription.info("Running LS-EEND diarization on system audio...")
-                let dm = DiarizationManager()
-                let variant = LSEENDVariant(rawValue: diarizationVariant.rawValue) ?? .dihard3
-                try await dm.load(variant: variant)
                 // Process complete audio file through diarizer
                 let samples = try BatchAudioSampleReader.readAll(
                     url: sysURL,
@@ -579,7 +656,7 @@ actor BatchAudioTranscriber {
                 )
                 try await dm.feedAudio(samples)
                 await dm.finalize()
-                batchDiarizer = dm
+                sysDiarizer = dm
                 Log.batchTranscription.info("Diarization complete")
             } else if useElevenLabsNativeDiarization {
                 Log.batchTranscription.info("Using ElevenLabs native diarization for system audio")
@@ -595,7 +672,7 @@ actor BatchAudioTranscriber {
                 locale: locale,
                 progressBase: Double(filesProcessed) / Double(totalFiles),
                 progressScale: 1.0 / Double(totalFiles),
-                diarizationManager: batchDiarizer,
+                diarizationManager: sysDiarizer,
                 useElevenLabsNativeDiarization: useElevenLabsNativeDiarization
             )
             Log.batchTranscription.debug("Sys transcription: \(sysRecords.count, privacy: .public) records")
@@ -663,6 +740,7 @@ actor BatchAudioTranscriber {
         progressBase: Double,
         progressScale: Double,
         diarizationManager: DiarizationManager? = nil,
+        diarizationChannel: DiarizationManager.Channel = .system,
         useElevenLabsNativeDiarization: Bool = false
     ) async throws -> [SessionRecord] {
         guard let audioFile = try? AVAudioFile(forReading: url) else {
@@ -727,8 +805,16 @@ actor BatchAudioTranscriber {
 
                 let slices: [BatchTranscriptionSegmentLayout.Slice]
                 if let dm = diarizationManager {
-                    let fallbackSpeaker = await dm.dominantSpeaker(from: segmentStartTime, to: segmentEndTime)
-                    let diarizedRuns = await dm.speakerRuns(from: segmentStartTime, to: segmentEndTime)
+                    let fallbackSpeaker = await dm.dominantSpeaker(
+                        from: segmentStartTime,
+                        to: segmentEndTime,
+                        channel: diarizationChannel
+                    )
+                    let diarizedRuns = await dm.speakerRuns(
+                        from: segmentStartTime,
+                        to: segmentEndTime,
+                        channel: diarizationChannel
+                    )
                     slices = BatchTranscriptionSegmentLayout.slices(
                         for: .init(
                             startTime: segmentStartTime,
@@ -751,7 +837,17 @@ actor BatchAudioTranscriber {
                 for slice in slices {
                     let rangeEnd = min(segment.samples.count, slice.startSample + slice.sampleCount)
                     guard slice.startSample < rangeEnd else { continue }
-                    let sliceSamples = Array(segment.samples[slice.startSample..<rangeEnd])
+                    var sliceSamples = Array(segment.samples[slice.startSample..<rangeEnd])
+                    // Parakeet rejects clips under 1 s outright, and diarized
+                    // speaker runs (min 0.8 s) and VAD segments (min 0.5 s) can
+                    // both be shorter. Pad with trailing silence instead of
+                    // letting one short slice fail the whole batch.
+                    let minimumSampleCount = 16_000
+                    if sliceSamples.count < minimumSampleCount {
+                        sliceSamples.append(
+                            contentsOf: [Float](repeating: 0, count: minimumSampleCount - sliceSamples.count)
+                        )
+                    }
                     let text = try await backend.transcribe(sliceSamples, locale: locale, previousContext: nil)
                     guard !text.isEmpty else { continue }
 
@@ -799,6 +895,29 @@ actor BatchAudioTranscriber {
                 text: segment.text,
                 timestamp: baseTimestamp.addingTimeInterval(segment.startTime)
             )
+        }
+    }
+
+    /// Rewrite the diarized speaker matched to the enrolled voiceprint as .you,
+    /// and reletter the remaining in-person speakers contiguously so guests
+    /// always start at Speaker A.
+    private static func relabelSelfSpeaker(in records: [SessionRecord], selfIndex: Int) -> [SessionRecord] {
+        let selfSpeaker = Speaker.local(selfIndex + 1)
+        let remaining = Set(
+            records.compactMap { record -> Int? in
+                guard case .local(let n) = record.speaker, record.speaker != selfSpeaker else { return nil }
+                return n
+            }
+        ).sorted()
+
+        var mapping: [Speaker: Speaker] = [selfSpeaker: .you]
+        for (offset, n) in remaining.enumerated() {
+            mapping[.local(n)] = .local(offset + 1)
+        }
+
+        return records.map { record in
+            guard let mapped = mapping[record.speaker], mapped != record.speaker else { return record }
+            return record.withSpeaker(mapped)
         }
     }
 

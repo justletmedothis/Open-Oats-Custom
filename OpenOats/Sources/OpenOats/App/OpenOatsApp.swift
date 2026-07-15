@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import AVFoundation
+import KeyboardShortcuts
 import Sparkle
 import UniformTypeIdentifiers
 import UserNotifications
@@ -109,7 +110,7 @@ public struct OpenOatsRootApp: App {
                 Button("Toggle Meeting") {
                     appDelegate.toggleMeeting()
                 }
-                .keyboardShortcut("l", modifiers: [.command, .shift])
+                .globalKeyboardShortcut(.toggleMeeting)
 
                 Button("Notes Workspace") {
                     openNotesWindow()
@@ -375,9 +376,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         ProcessInfo.processInfo.environment["OPENOATS_UI_TEST"] != nil
     }
 
-    private var globalHotkeyMonitor: Any?
-    private var localHotkeyMonitor: Any?
-
     func applicationDidFinishLaunching(_ notification: Notification) {
         if !isUITest {
             NSApp.setActivationPolicy(.regular)
@@ -428,7 +426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
 
-        registerGlobalHotkey()
+        registerGlobalHotkeys()
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -551,40 +549,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    // MARK: - Global Hotkey (Cmd+Shift+L)
+    // MARK: - Global Hotkeys (customizable in Settings > General)
 
-    private func registerGlobalHotkey() {
-        let matchesMeetingHotkey: (NSEvent) -> Bool = { event in
-            event.modifierFlags.contains([.command, .shift])
-                && event.charactersIgnoringModifiers?.lowercased() == "l"
+    private func registerGlobalHotkeys() {
+        KeyboardShortcuts.onKeyDown(for: .toggleMeeting) { [weak self] in
+            self?.toggleMeeting()
         }
 
-        let matchesPanelHotkey: (NSEvent) -> Bool = { event in
-            event.modifierFlags.contains([.command, .shift])
-                && event.charactersIgnoringModifiers?.lowercased() == "o"
-        }
-
-        globalHotkeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if matchesMeetingHotkey(event) {
-                Task { @MainActor in self?.toggleMeeting() }
-            } else if matchesPanelHotkey(event) {
-                Task { @MainActor in
-                    NotificationCenter.default.post(name: .toggleSuggestionPanel, object: nil)
-                }
-            }
-        }
-
-        localHotkeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if matchesMeetingHotkey(event) {
-                Task { @MainActor in self?.toggleMeeting() }
-                return nil
-            } else if matchesPanelHotkey(event) {
-                Task { @MainActor in
-                    NotificationCenter.default.post(name: .toggleSuggestionPanel, object: nil)
-                }
-                return nil
-            }
-            return event
+        KeyboardShortcuts.onKeyDown(for: .toggleSuggestionPanel) {
+            NotificationCenter.default.post(name: .toggleSuggestionPanel, object: nil)
         }
     }
 

@@ -1048,6 +1048,9 @@ actor SessionRepository {
         guard var meta = loadSessionMetadataFile(sessionID: sessionID) else { return }
         meta.speakerNames = speakerNames.isEmpty ? nil : speakerNames
         writeSessionMetadata(meta, sessionID: sessionID)
+        // The mirrored markdown renders speaker names; rewrite it so renames
+        // don't leave stale labels on disk.
+        scheduleMirror(sessionID: sessionID)
     }
 
     func updateSessionCalendarEvent(sessionID: String, calendarEvent: CalendarEvent?) {
@@ -1362,7 +1365,8 @@ actor SessionRepository {
 
         for record in records {
             let displayText = record.cleanedText ?? record.text
-            result += "[\(timeFmt.string(from: record.timestamp))] \(record.speaker.displayLabel): \(displayText)\n"
+            let label = record.speaker.displayName(speakerNames: meta?.speakerNames)
+            result += "[\(timeFmt.string(from: record.timestamp))] \(label): \(displayText)\n"
         }
 
         return result
@@ -1964,7 +1968,8 @@ actor SessionRepository {
             source: meta?.source,
             meetingFamilyKey: meta?.calendarEvent.flatMap { MeetingHistoryResolver.seriesHistoryKey(for: $0) },
             transcriptIssue: meta?.transcriptIssue,
-            transcriptRecovery: meta?.transcriptRecovery
+            transcriptRecovery: meta?.transcriptRecovery,
+            speakerNames: meta?.speakerNames
         )
 
         let outputTarget = MarkdownMeetingWriter.write(
