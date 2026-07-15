@@ -540,6 +540,7 @@ final class NotesController {
         let capturedTranscript = state.loadedTranscript
         let capturedCalendarEvent = state.loadedCalendarEvent
         let capturedGuidance = state.customNotesGuidance
+        let capturedSpeakerNames = state.sessionHistory.first(where: { $0.id == sessionID })?.speakerNames
 
         generatingSessionID = sessionID
         cancelledGenerationSessionIDs.remove(sessionID)
@@ -551,6 +552,7 @@ final class NotesController {
 
             coordinator.notesEngine.generate(
                 transcript: capturedTranscript,
+                speakerNames: capturedSpeakerNames,
                 template: template,
                 settings: settings,
                 calendarEvent: capturedCalendarEvent,

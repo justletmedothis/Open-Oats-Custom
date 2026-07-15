@@ -1126,6 +1126,7 @@ final class LiveSessionController {
         do {
             let generatedMarkdown = try await coordinator.notesEngine.generateMarkdownDetached(
                 transcript: sessionData.transcript,
+                speakerNames: session.speakerNames,
                 template: template,
                 settings: settings,
                 calendarEvent: sessionData.calendarEvent,

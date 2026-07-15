@@ -3634,8 +3634,9 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
         let text: String
         switch detailViewMode {
         case .transcript:
+            let speakerNames = selectedSession(in: state)?.speakerNames
             text = state.loadedTranscript.map { record in
-                let label = record.speaker.displayLabel
+                let label = record.speaker.displayName(speakerNames: speakerNames)
                 let content = state.showingOriginal ? record.text : (record.cleanedText ?? record.text)
                 return "[\(MeetingDetailPaneFormatters.transcriptTimeFormatter.string(from: record.timestamp))] \(label): \(content)"
             }.joined(separator: "\n")
@@ -3658,7 +3659,12 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
         askError = nil
         askMessages.append(TranscriptChatMessage(role: .user, text: question))
 
-        let messages = buildAskMessages(question: question, transcript: state.loadedTranscript, history: history)
+        let messages = buildAskMessages(
+            question: question,
+            transcript: state.loadedTranscript,
+            speakerNames: selectedSession(in: state)?.speakerNames,
+            history: history
+        )
         let apiKey = settings.activeLLMApiKey
         let model = settings.activeNotesModel
         let baseURL = settings.activeLLMBaseURL
@@ -3694,6 +3700,7 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
     private func buildAskMessages(
         question: String,
         transcript: [SessionRecord],
+        speakerNames: [String: String]?,
         history: [TranscriptChatMessage]
     ) -> [OpenRouterClient.Message] {
         var messages = [
@@ -3707,7 +3714,7 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
                 role: "user",
                 content: """
                 Transcript:
-                \(truncatedTranscriptText(transcript))
+                \(truncatedTranscriptText(transcript, speakerNames: speakerNames))
                 """
             )
         ]
@@ -3724,8 +3731,8 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
         return messages
     }
 
-    private func truncatedTranscriptText(_ transcript: [SessionRecord]) -> String {
-        let fullText = formattedTranscript(transcript)
+    private func truncatedTranscriptText(_ transcript: [SessionRecord], speakerNames: [String: String]?) -> String {
+        let fullText = formattedTranscript(transcript, speakerNames: speakerNames)
         let maxCharacters = 80_000
         guard fullText.count > maxCharacters else { return fullText }
 
@@ -3735,11 +3742,11 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
         return "\(prefix)\n\n[Transcript truncated: middle omitted]\n\n\(suffix)"
     }
 
-    private func formattedTranscript(_ transcript: [SessionRecord]) -> String {
+    private func formattedTranscript(_ transcript: [SessionRecord], speakerNames: [String: String]?) -> String {
         transcript.map { record in
             let timestamp = MeetingDetailPaneFormatters.transcriptTimeFormatter.string(from: record.timestamp)
             let text = record.cleanedText ?? record.text
-            return "[\(timestamp)] \(record.speaker.displayLabel): \(text)"
+            return "[\(timestamp)] \(record.speaker.displayName(speakerNames: speakerNames)): \(text)"
         }
         .joined(separator: "\n")
     }
