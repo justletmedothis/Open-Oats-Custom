@@ -52,13 +52,25 @@ final class VoiceEnrollmentController {
         var samples: [Float] = []
         samples.reserveCapacity(targetSamples)
 
+        // If the device disappears mid-capture and the engine restart fails,
+        // MicCapture records the error but buffers just stop arriving, which
+        // would leave the loop below awaiting forever. Force the stream shut
+        // after a hard deadline so every capture ends in a user-visible state.
+        let watchdog = Task {
+            try? await Task.sleep(for: .seconds(Self.recordingSeconds + 5))
+            guard !Task.isCancelled else { return }
+            capture.stop()
+        }
+
         for await buffer in stream {
             if Task.isCancelled { break }
+            if capture.captureError != nil { break }
             samples.append(contentsOf: BatchAudioSampleReader.resample(buffer, targetRate: Self.targetRate))
             let remaining = max(0, Self.recordingSeconds - samples.count / Int(Self.targetRate))
             phase = .recording(secondsRemaining: remaining)
             if samples.count >= targetSamples { break }
         }
+        watchdog.cancel()
         capture.stop()
 
         if Task.isCancelled {
@@ -80,6 +92,13 @@ final class VoiceEnrollmentController {
             let embedding = try await Task.detached(priority: .userInitiated) {
                 try await SelfVoiceIdentifier.extractEmbedding(from: clip)
             }.value
+            // The detached task doesn't inherit cancellation; if the user
+            // cancelled while the embedding was computing, don't overwrite
+            // the stored profile behind their back.
+            guard !Task.isCancelled else {
+                phase = .idle
+                return
+            }
             let newProfile = VoiceprintProfile(
                 embedding: embedding,
                 createdAt: Date(),

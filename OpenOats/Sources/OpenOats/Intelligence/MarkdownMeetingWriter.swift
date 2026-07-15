@@ -126,12 +126,16 @@ enum MarkdownMeetingWriter {
         lines.append("date: \(formatISO8601(metadata.startedAt))")
         lines.append("duration: \(computeDuration(records: records, metadata: metadata))")
 
-        // Participants - derived from actual speakers in the transcript
+        // Participants - derived from actual speakers in the transcript.
+        // Built-in labels (You, Speaker A, ...) are YAML-safe and stay bare;
+        // user-entered names can contain YAML metacharacters, so quote them.
         let speakerLabels: [String] = {
             var seen: [String] = []
             for r in records {
+                let isCustom = metadata.speakerNames?[r.speaker.storageKey] != nil
                 let label = speakerLabel(r.speaker, speakerNames: metadata.speakerNames)
-                if !seen.contains(label) { seen.append(label) }
+                let entry = isCustom ? yamlQuote(label) : label
+                if !seen.contains(entry) { seen.append(entry) }
             }
             return seen.isEmpty ? ["You", "Them"] : seen
         }()

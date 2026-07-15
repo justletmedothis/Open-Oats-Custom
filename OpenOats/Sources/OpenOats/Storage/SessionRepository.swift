@@ -1048,6 +1048,9 @@ actor SessionRepository {
         guard var meta = loadSessionMetadataFile(sessionID: sessionID) else { return }
         meta.speakerNames = speakerNames.isEmpty ? nil : speakerNames
         writeSessionMetadata(meta, sessionID: sessionID)
+        // The mirrored markdown renders speaker names; rewrite it so renames
+        // don't leave stale labels on disk.
+        scheduleMirror(sessionID: sessionID)
     }
 
     func updateSessionCalendarEvent(sessionID: String, calendarEvent: CalendarEvent?) {
