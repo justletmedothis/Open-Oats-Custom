@@ -29,6 +29,11 @@ enum SelfVoiceIdentifier {
         }
     }
 
+    /// Cosine distance between two speaker embeddings (FluidAudio's metric).
+    static func distance(_ a: [Float], _ b: [Float]) -> Float {
+        SpeakerUtilities.cosineDistance(a, b)
+    }
+
     /// Extract an L2-normalized speaker embedding from a 16 kHz mono clip, for
     /// enrolling the user's voice profile. Downloads the segmentation and
     /// embedding models on first use.
@@ -87,6 +92,32 @@ enum SelfVoiceIdentifier {
             return nil
         }
         return best.index
+    }
+
+    /// Extract one embedding per diarized speaker with enough audio, keyed by
+    /// diarizer index. Feeds the persistent speaker library (auto-naming and
+    /// "Remember this voice" enrollment). Best-effort: speakers whose audio
+    /// fails validation are simply omitted.
+    static func speakerEmbeddings(
+        samples: [Float],
+        speakerSegments: [Int: [DiarizationManager.SpeakerSegment]],
+        excluding excludedIndex: Int? = nil
+    ) async -> [Int: [Float]] {
+        guard !speakerSegments.isEmpty else { return [:] }
+        guard let models = try? await DiarizerModels.downloadIfNeeded() else { return [:] }
+        let manager = DiarizerManager()
+        manager.initialize(models: models)
+        defer { manager.cleanup() }
+
+        var result: [Int: [Float]] = [:]
+        for (index, segments) in speakerSegments where index != excludedIndex {
+            let clip = clip(from: samples, segments: segments)
+            guard Double(clip.count) / sampleRate >= minClipSeconds else { continue }
+            guard let embedding = try? manager.extractSpeakerEmbedding(from: clip),
+                  manager.validateEmbedding(embedding) else { continue }
+            result[index] = embedding
+        }
+        return result
     }
 
     /// Concatenate a speaker's longest diarized segments into a single clip,

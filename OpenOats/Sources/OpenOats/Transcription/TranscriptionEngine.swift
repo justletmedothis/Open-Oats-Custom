@@ -219,6 +219,10 @@ final class TranscriptionEngine {
 
     /// Speaker diarization manager for system audio (nil when diarization is disabled).
     private var diarizationManager: DiarizationManager?
+    /// LS-EEND on the mic channel: live in-person speaker splitting.
+    private var micDiarizationManager: DiarizationManager?
+    /// Live scoring of lettered mic speakers against the enrolled voiceprint.
+    private var selfVoiceMatcher: LiveSelfVoiceMatcher?
 
     /// Active transcription model captured for the current session/startup.
     @ObservationIgnored nonisolated(unsafe) var activeTranscriptionSession: ActiveTranscriptionSession?
@@ -354,7 +358,10 @@ final class TranscriptionEngine {
         beginDownloadTracking(for: transcriptionModel)
 
         let vocab = settings.transcriptionCustomVocabulary
-        let backend = transcriptionModel.makeBackend(customVocabulary: vocab)
+        let backend = transcriptionModel.makeBackend(
+            customVocabulary: vocab,
+            localeIdentifier: settings.transcriptionLocale
+        )
         do {
             try await prepareBackend(backend)
             needsModelDownload = false
@@ -445,7 +452,8 @@ final class TranscriptionEngine {
                 mic = transcriptionModel.makeBackend(
                     customVocabulary: vocab,
                     apiKey: apiKey,
-                    removeFillerWords: noFiller
+                    removeFillerWords: noFiller,
+                    localeIdentifier: settings.transcriptionLocale
                 )
                 try await prepareBackend(mic)
             }
@@ -453,7 +461,9 @@ final class TranscriptionEngine {
 
             // Parakeet needs a separate backend for system audio (mutable decoder state).
             // Qwen3 is actor-based and thread-safe, so reuse the same instance.
-            if transcriptionModel == .qwen3ASR06B || transcriptionModel.isCloud {
+            // Apple Speech is stateless per call (the live path builds its own
+            // analyzers), so one shared backend is fine.
+            if transcriptionModel == .qwen3ASR06B || transcriptionModel == .appleSpeech || transcriptionModel.isCloud {
                 self.systemBackend = mic
             } else {
                 let sys = transcriptionModel.makeBackend(customVocabulary: vocab, apiKey: apiKey, removeFillerWords: noFiller)
@@ -477,6 +487,25 @@ final class TranscriptionEngine {
                 Log.transcription.info("Diarization model loaded")
             } else {
                 self.diarizationManager = nil
+            }
+
+            // Mic-channel diarization: live in-person speaker splitting, with
+            // voiceprint self-recognition when a profile is enrolled. Runs its
+            // own LS-EEND instance (streaming state is per-channel).
+            if settings.enableMicDiarization {
+                assetStatus = "Loading in-person diarization model..."
+                Log.transcription.info("Loading LS-EEND mic diarization model")
+                let dm = DiarizationManager()
+                let variant = LSEENDVariant(rawValue: settings.diarizationVariant.rawValue) ?? .dihard3
+                try await dm.load(variant: variant)
+                self.micDiarizationManager = dm
+                if let voiceprint = VoiceprintStore.load()?.embedding {
+                    self.selfVoiceMatcher = LiveSelfVoiceMatcher(voiceprint: voiceprint)
+                }
+                Log.transcription.info("Mic diarization model loaded")
+            } else {
+                self.micDiarizationManager = nil
+                self.selfVoiceMatcher = nil
             }
 
             needsModelDownload = false
@@ -522,13 +551,15 @@ final class TranscriptionEngine {
             return
         }
         currentMicDeviceID = targetMicID
-        // AEC (voice processing) conflicts with system audio capture on macOS —
-        // both cause CoreAudio aggregate-device reconfiguration that can stall the
-        // mic stream. Since system audio capture is always active during recording,
-        // AEC must be disabled to prevent capture failures.
-        let useAEC = false
-        if settings.enableEchoCancellation {
-            Log.transcription.info("AEC disabled - conflicts with system audio capture")
+        // AEC (voice processing) historically conflicted with the system tap:
+        // VPIO's default ducking silences other audio (≈ -50 dB on the tap) and
+        // aggregate-device reconfiguration could stall the mic stream. MicCapture
+        // now disables ducking when enabling voice processing, which is the
+        // documented fix for tap coexistence. Honor the user setting; the 5 s
+        // no-audio health check below retries without AEC if capture stalls.
+        let useAEC = settings.enableEchoCancellation
+        if useAEC {
+            Log.transcription.info("AEC enabled (voice processing with ducking disabled)")
         }
 
         Log.transcription.info("Starting mic capture, targetMicID=\(targetMicID, privacy: .public), aec=\(useAEC, privacy: .public)")
@@ -770,11 +801,16 @@ final class TranscriptionEngine {
         pendingMicDeviceID = nil
         micKeepAliveTask = nil
         currentMicDeviceID = 0
-        // Finalize and release diarization manager
+        // Finalize and release diarization managers
         if let dm = diarizationManager {
             await dm.finalize()
         }
         diarizationManager = nil
+        if let dm = micDiarizationManager {
+            await dm.finalize()
+        }
+        micDiarizationManager = nil
+        selfVoiceMatcher = nil
 
         micBackend = nil
         systemBackend = nil
@@ -826,6 +862,8 @@ final class TranscriptionEngine {
         liveCloudTranscriptionIsProcessing = false
         preparedCloudStartBackend = nil
         activeTranscriptionSession = nil
+        micDiarizationManager = nil
+        selfVoiceMatcher = nil
         isRunning = false
         assetStatus = "Ready"
     }
@@ -926,6 +964,22 @@ final class TranscriptionEngine {
                 recorder.writeMicBuffer(buffer)
             }
         }
+
+        // Tee mic audio to the in-person diarizer (and the self-voice matcher's
+        // rolling buffer, which must stay aligned with the diarizer timeline).
+        if let dm = micDiarizationManager {
+            var onSamples: (@Sendable ([Float]) async -> Void)?
+            if let matcher = selfVoiceMatcher {
+                onSamples = { samples in await matcher.appendAudio(samples) }
+            }
+            let feeder = DiarizationStreamFeeder(
+                dm: dm,
+                channelName: "mic",
+                onSamples: onSamples
+            )
+            micStream = Self.diarizationTappedStream(micStream, feeder: feeder)
+        }
+
         let store = transcriptStore
         guard let micTranscriber = makeTranscriber(
             locale: locale,
@@ -934,10 +988,40 @@ final class TranscriptionEngine {
             onPartial: { text in
                 Task { @MainActor in store.volatileYouText = text }
             },
-            onFinal: { segment in
+            onFinal: { [weak self] segment in
                 Task { @MainActor in
                     store.volatileYouText = ""
-                    store.append(Utterance(text: segment.text, speaker: .you))
+                    var speaker: Speaker = .you
+                    if let self, let dm = self.micDiarizationManager {
+                        speaker = await dm.dominantSpeaker(
+                            from: segment.startTime,
+                            to: segment.endTime,
+                            channel: .microphone
+                        )
+                        if case .local(let n) = speaker, let matcher = self.selfVoiceMatcher {
+                            if await matcher.isSelf(localSpeakerNumber: n) {
+                                speaker = .you
+                            } else if await matcher.noteUtterance(
+                                localSpeakerNumber: n,
+                                startTime: segment.startTime,
+                                endTime: segment.endTime
+                            ) {
+                                // Just identified as the user — catch earlier
+                                // bubbles up too.
+                                speaker = .you
+                                store.relabel(from: .local(n), to: .you)
+                            }
+                        }
+                    }
+                    store.append(
+                        Utterance(
+                            text: segment.text,
+                            speaker: speaker,
+                            startTime: segment.startTime,
+                            endTime: segment.endTime,
+                            source: .microphone
+                        )
+                    )
                 }
             }
         ) else {
@@ -986,50 +1070,12 @@ final class TranscriptionEngine {
             }
         }
 
-        // Tee system audio to diarization manager if enabled
+        // Tee system audio to diarization manager if enabled. The feeder
+        // resamples to the 16 kHz the diarizer expects (the raw tap runs at
+        // the output device's native rate).
         if let dm = diarizationManager {
-            let diarFlushSize = 16000
-            let originalSysStream = sysStream
-            let (diarTapped, diarContinuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
-            Task {
-                let safeDm = dm
-                var diarizationRelay = DiarizationFeedRelay()
-                var diarBuf: [Float] = []
-                for await buffer in originalSysStream {
-                    nonisolated(unsafe) let b = buffer
-                    diarContinuation.yield(b)
-                    guard let channelData = buffer.floatChannelData else { continue }
-                    let frameCount = Int(buffer.frameLength)
-                    diarBuf.append(contentsOf: UnsafeBufferPointer(start: channelData[0], count: frameCount))
-                    if diarBuf.count >= diarFlushSize {
-                        let batch = diarBuf
-                        diarBuf.removeAll(keepingCapacity: true)
-                        await diarizationRelay.feedAudio(
-                            batch,
-                            into: { samples in try await safeDm.feedAudio(samples) },
-                            onFailure: { error in
-                                Log.transcription.error(
-                                    "Diarization feed failed: \(error, privacy: .public)"
-                                )
-                            }
-                        )
-                    }
-                }
-                // Flush tail
-                if !diarBuf.isEmpty {
-                    await diarizationRelay.feedAudio(
-                        diarBuf,
-                        into: { samples in try await safeDm.feedAudio(samples) },
-                        onFailure: { error in
-                            Log.transcription.error(
-                                "Diarization feed failed: \(error, privacy: .public)"
-                            )
-                        }
-                    )
-                }
-                diarContinuation.finish()
-            }
-            sysStream = diarTapped
+            let feeder = DiarizationStreamFeeder(dm: dm, channelName: "sys")
+            sysStream = Self.diarizationTappedStream(sysStream, feeder: feeder)
         }
 
         let store = transcriptStore
@@ -1049,7 +1095,15 @@ final class TranscriptionEngine {
                     } else {
                         speaker = .them
                     }
-                    store.append(Utterance(text: segment.text, speaker: speaker))
+                    store.append(
+                        Utterance(
+                            text: segment.text,
+                            speaker: speaker,
+                            startTime: segment.startTime,
+                            endTime: segment.endTime,
+                            source: .system
+                        )
+                    )
                 }
             }
         ) else {
@@ -1062,19 +1116,53 @@ final class TranscriptionEngine {
         }
     }
 
+    /// Passes a capture stream through unchanged while feeding a resampling
+    /// diarization feeder; flushes the feeder's tail when the stream ends.
+    private nonisolated static func diarizationTappedStream(
+        _ stream: AsyncStream<AVAudioPCMBuffer>,
+        feeder: DiarizationStreamFeeder
+    ) -> AsyncStream<AVAudioPCMBuffer> {
+        struct Box: @unchecked Sendable { let stream: AsyncStream<AVAudioPCMBuffer> }
+        let box = Box(stream: stream)
+        let (tapped, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        Task.detached {
+            for await buffer in box.stream {
+                nonisolated(unsafe) let b = buffer
+                continuation.yield(b)
+                await feeder.ingest(b)
+            }
+            await feeder.flush()
+            continuation.finish()
+        }
+        return tapped
+    }
+
     private func makeTranscriber(
         locale: Locale,
         speaker: Speaker,
         vadManager: VadManager,
         onPartial: @escaping @Sendable (String) -> Void,
         onFinal: @escaping @Sendable (StreamingTranscriber.FinalSegment) -> Void
-    ) -> StreamingTranscriber? {
+    ) -> (any LiveTranscribing)? {
+        let model = currentTranscriptionModel()
+
+        // Apple Speech streams natively (volatile → finalized) through
+        // SpeechAnalyzer instead of the VAD/segment loop.
+        if model == .appleSpeech, #available(macOS 26.0, *) {
+            return AppleSpeechLiveTranscriber(
+                locale: locale,
+                speakerKey: speaker.storageKey,
+                customVocabulary: settings.transcriptionCustomVocabulary,
+                onPartial: onPartial,
+                onFinal: onFinal
+            )
+        }
+
         let backend = speaker == .you ? micBackend : systemBackend
         guard let backend else {
             Log.transcription.error("makeTranscriber called without initialized backend for \(speaker.storageKey, privacy: .public)")
             return nil
         }
-        let model = currentTranscriptionModel()
         return StreamingTranscriber(
             backend: backend,
             locale: locale,

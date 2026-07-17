@@ -60,6 +60,7 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
     @FocusState private var renameFieldFocused: Bool
     @State private var renamingSpeakerKey: String? = nil
     @State private var speakerRenameText: String = ""
+    @State private var rememberSpeakerVoice: Bool = false
     @State private var editingTagsSessionID: String?
     @State private var editingTags: [String] = []
     @State private var newTagText: String = ""
@@ -3354,6 +3355,7 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
                 if isRenameable {
                     Button(label) {
                         speakerRenameText = label
+                        rememberSpeakerVoice = false
                         renamingSpeakerKey = speakerKey
                     }
                     .buttonStyle(.plain)
@@ -3363,7 +3365,9 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
                     )) {
                         SpeakerRenamePopover(
                             text: $speakerRenameText,
-                            placeholder: record.speaker.displayLabel
+                            placeholder: record.speaker.displayLabel,
+                            rememberVoice: $rememberSpeakerVoice,
+                            showRememberVoice: speakerKey.hasPrefix("local_")
                         ) {
                             guard let sid = sessionID else { return }
                             var names = speakerNames ?? [:]
@@ -3372,6 +3376,13 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
                                 names.removeValue(forKey: speakerKey)
                             } else {
                                 names[speakerKey] = trimmed
+                                if rememberSpeakerVoice {
+                                    controller.rememberSpeakerVoice(
+                                        sessionID: sid,
+                                        speakerKey: speakerKey,
+                                        name: trimmed
+                                    )
+                                }
                             }
                             controller.updateSessionSpeakerNames(sessionID: sid, speakerNames: names)
                             renamingSpeakerKey = nil
@@ -3392,6 +3403,65 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
                     isCleaning && record.cleanedText == nil ? .secondary : .primary
                 )
                 .textSelection(.enabled)
+        }
+        .contextMenu {
+            if let sid = sessionID {
+                speakerCorrectionMenu(record: record, sessionID: sid, speakerNames: speakerNames)
+            }
+        }
+    }
+
+    /// Distinct speakers present in the loaded transcript (You always offered),
+    /// in first-appearance order, as reassignment targets.
+    private var sessionSpeakers: [Speaker] {
+        var seen: Set<Speaker> = []
+        var result: [Speaker] = []
+        for record in state.loadedTranscript where seen.insert(record.speaker).inserted {
+            result.append(record.speaker)
+        }
+        if seen.insert(.you).inserted {
+            result.insert(.you, at: 0)
+        }
+        return result
+    }
+
+    @ViewBuilder
+    private func speakerCorrectionMenu(
+        record: SessionRecord,
+        sessionID: String,
+        speakerNames: [String: String]?
+    ) -> some View {
+        let targets = sessionSpeakers.filter { $0 != record.speaker }
+        if record.speaker != .you {
+            Button("This line was me") {
+                controller.reassignUtteranceSpeaker(sessionID: sessionID, record: record, to: .you)
+            }
+        }
+        if !targets.isEmpty {
+            Menu("Reassign line to") {
+                ForEach(targets, id: \.storageKey) { target in
+                    Button(target.displayName(speakerNames: speakerNames)) {
+                        controller.reassignUtteranceSpeaker(sessionID: sessionID, record: record, to: target)
+                    }
+                }
+            }
+        }
+        if record.speaker.isRenameable {
+            let label = record.speaker.displayName(speakerNames: speakerNames)
+            Divider()
+            Button("All \u{201C}\(label)\u{201D} lines were me") {
+                controller.relabelSpeakerAsMe(sessionID: sessionID, speakerKey: record.speaker.storageKey)
+            }
+            let mergeTargets = targets.filter(\.isRenameable)
+            if !mergeTargets.isEmpty {
+                Menu("Merge \u{201C}\(label)\u{201D} into") {
+                    ForEach(mergeTargets, id: \.storageKey) { target in
+                        Button(target.displayName(speakerNames: speakerNames)) {
+                            controller.mergeSpeaker(sessionID: sessionID, fromKey: record.speaker.storageKey, into: target)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3835,6 +3905,8 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
 private struct SpeakerRenamePopover: View {
     @Binding var text: String
     let placeholder: String
+    var rememberVoice: Binding<Bool>? = nil
+    var showRememberVoice: Bool = false
     let onCommit: () -> Void
 
     @FocusState private var focused: Bool
@@ -3849,6 +3921,14 @@ private struct SpeakerRenamePopover: View {
                 .frame(width: 180)
                 .focused($focused)
                 .onSubmit(onCommit)
+            if showRememberVoice, let rememberVoice {
+                Toggle("Remember this voice", isOn: rememberVoice)
+                    .font(.system(size: 12))
+                Text("Auto-names them in future meetings. The voiceprint stays on this Mac.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 180, alignment: .leading)
+            }
             HStack {
                 Button("Cancel") { text = ""; onCommit() }
                     .buttonStyle(.plain)

@@ -11,6 +11,20 @@ struct SidecastPanelContent: View {
             // Header
             SidecastHeader(isGenerating: engine?.isGenerating ?? false)
 
+            if let errorMessage = engine?.lastErrorMessage {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                    Text(errorMessage)
+                        .font(.system(size: 11))
+                        .lineLimit(2)
+                }
+                .foregroundStyle(Color.orange.opacity(0.9))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
+            }
+
             Divider().opacity(0.3)
 
             // Persona cards — use a task-driven timer instead of TimelineView so
@@ -47,7 +61,8 @@ private struct PersonaCardList: View {
                         persona: persona,
                         message: engine?.message(for: persona.id),
                         now: now,
-                        lifetime: settings.sidecastIntensity.bubbleLifetimeSeconds
+                        lifetime: settings.sidecastIntensity.bubbleLifetimeSeconds,
+                        isGenerating: engine?.isGenerating ?? false
                     )
                 }
             }
@@ -109,6 +124,7 @@ private struct SidecastPersonaCard: View {
     let message: SidecastMessage?
     let now: Date
     let lifetime: TimeInterval
+    let isGenerating: Bool
 
     private var visibleMessage: SidecastMessage? {
         guard let message else { return nil }
@@ -176,10 +192,20 @@ private struct SidecastPersonaCard: View {
                                 .foregroundStyle(.white.opacity(0.4))
                         }
                     }
+                } else if isGenerating {
+                    HStack(spacing: 5) {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .tint(.white.opacity(0.4))
+                        Text("Thinking…")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.35))
+                            .italic()
+                    }
                 } else {
-                    Text("Processing…")
+                    Text("Listening…")
                         .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.25))
+                        .foregroundStyle(.white.opacity(0.2))
                         .italic()
                 }
             }

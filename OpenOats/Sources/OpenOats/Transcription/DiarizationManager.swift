@@ -35,8 +35,19 @@ actor DiarizationManager {
         let end: Float
     }
 
-    private nonisolated(unsafe) let diarizer = LSEENDDiarizer()
+    /// Meeting-tuned timeline post-processing (frames are ~100 ms): drop
+    /// speaker turns under 0.3 s, bridge same-speaker gaps under 0.6 s, and pad
+    /// onsets 0.1 s so word starts aren't clipped. Mirrors the NeMo meeting
+    /// recipe (min_duration_off 0.6) and the production 250-400 ms turn floor.
+    private nonisolated(unsafe) let diarizer = LSEENDDiarizer(
+        onsetPadFrames: 1,
+        minFramesOn: 3,
+        minFramesOff: 6
+    )
     private var isInitialized = false
+    /// Diarizer index most recently returned by dominantSpeaker, for
+    /// sticky-speaker hysteresis on borderline overlap calls.
+    private var lastDominantIndex: Int?
 
     /// Load the LS-EEND model for the given variant. Must be called before feedAudio/dominantSpeaker.
     func load(variant: LSEENDVariant = .dihard3) async throws {
@@ -69,6 +80,7 @@ actor DiarizationManager {
 
         var bestSpeaker: Int = 0
         var bestOverlap: Float = 0
+        var overlapByIndex: [Int: Float] = [:]
 
         let queryStart = Float(startTime)
         let queryEnd = Float(endTime)
@@ -85,6 +97,7 @@ actor DiarizationManager {
                 }
             }
 
+            overlapByIndex[index] = overlap
             if overlap > bestOverlap {
                 bestOverlap = overlap
                 bestSpeaker = index
@@ -92,6 +105,18 @@ actor DiarizationManager {
         }
 
         guard bestOverlap > 0 else { return channel.fallbackSpeaker }
+
+        // Sticky-speaker hysteresis: on borderline calls (the previous speaker
+        // nearly ties the winner), keep the previous speaker rather than
+        // flipping labels mid-conversation. Production systems apply the same
+        // preference (e.g. Speechmatics prefer_current_speaker).
+        if let last = lastDominantIndex,
+           last != bestSpeaker,
+           let lastOverlap = overlapByIndex[last],
+           lastOverlap >= bestOverlap * 0.8 {
+            bestSpeaker = last
+        }
+        lastDominantIndex = bestSpeaker
 
         // If only one speaker was detected in the entire session, fall back to the
         // channel's single-speaker label (no point labeling "Speaker 1"/"Speaker A"
@@ -183,6 +208,7 @@ actor DiarizationManager {
     /// Reset the diarizer state for a new session.
     func reset() {
         guard isInitialized else { return }
+        lastDominantIndex = nil
         diarizer.reset()
     }
 }

@@ -336,6 +336,7 @@ enum DiarizationVariant: String, CaseIterable, Identifiable {
 }
 
 enum TranscriptionModel: String, CaseIterable, Identifiable {
+    case appleSpeech
     case parakeetV2
     case parakeetV3
     case qwen3ASR06B
@@ -355,8 +356,21 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Whether this model can run on the current OS. Apple Speech needs the
+    /// macOS 26 SpeechAnalyzer API; everything else runs on the deployment target.
+    var isAvailableOnThisMac: Bool {
+        switch self {
+        case .appleSpeech:
+            if #available(macOS 26.0, *) { return true }
+            return false
+        default:
+            return true
+        }
+    }
+
     var displayName: String {
         switch self {
+        case .appleSpeech: "Apple Speech"
         case .parakeetV2: "Parakeet TDT v2"
         case .parakeetV3: "Parakeet TDT v3"
         case .qwen3ASR06B: "Qwen3 ASR 0.6B"
@@ -371,6 +385,8 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
 
     var downloadPrompt: String {
         switch self {
+        case .appleSpeech:
+            "Apple Speech uses the system speech model — macOS downloads it once per language, outside the app."
         case .parakeetV2, .parakeetV3:
             "Transcription requires a one-time model download."
         case .qwen3ASR06B:
@@ -395,7 +411,7 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
         case .whisperBase: 142_000_000
         case .whisperSmall: 244_000_000
         case .whisperLargeV3Turbo: 800_000_000
-        case .parakeetV2, .parakeetV3, .qwen3ASR06B: nil
+        case .appleSpeech, .parakeetV2, .parakeetV3, .qwen3ASR06B: nil
         case .assemblyAI, .elevenLabsScribe, .cohereTranscribeArabic: nil
         }
     }
@@ -408,7 +424,7 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
         switch self {
         case .qwen3ASR06B:
             "Language Hint"
-        case .parakeetV2, .parakeetV3, .whisperBase, .whisperSmall, .whisperLargeV3Turbo:
+        case .appleSpeech, .parakeetV2, .parakeetV3, .whisperBase, .whisperSmall, .whisperLargeV3Turbo:
             "Locale"
         case .assemblyAI, .elevenLabsScribe, .cohereTranscribeArabic:
             "Language Hint"
@@ -417,6 +433,8 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
 
     var localeHelpText: String {
         switch self {
+        case .appleSpeech:
+            "Apple Speech transcribes in the language you set here (about 10 languages supported). macOS installs the language model once, system-wide."
         case .parakeetV2:
             "Parakeet TDT v2 is English-only. Use en-US. This language value is still saved with the session and markdown export."
         case .parakeetV3:
@@ -446,8 +464,9 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
         }
     }
 
-    func makeBackend(customVocabulary: String = "", apiKey: String = "", removeFillerWords: Bool = false) -> any TranscriptionBackend {
+    func makeBackend(customVocabulary: String = "", apiKey: String = "", removeFillerWords: Bool = false, localeIdentifier: String = "en-US") -> any TranscriptionBackend {
         switch self {
+        case .appleSpeech: return AppleSpeechBackend(localeIdentifier: localeIdentifier, customVocabulary: customVocabulary)
         case .parakeetV2: return ParakeetBackend(version: .v2, customVocabulary: customVocabulary)
         case .parakeetV3: return ParakeetBackend(version: .v3, customVocabulary: customVocabulary)
         case .qwen3ASR06B: return Qwen3Backend()
@@ -465,6 +484,10 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
     var flushIntervalSamples: Int {
         switch self {
         case .whisperBase, .whisperSmall, .whisperLargeV3Turbo:
+            10 * 16_000
+        case .appleSpeech:
+            // Only used if Apple Speech ever runs through the VAD/segment path
+            // (e.g. batch); the live path streams natively without flushing.
             10 * 16_000
         case .parakeetV2, .parakeetV3, .qwen3ASR06B:
             5 * 16_000

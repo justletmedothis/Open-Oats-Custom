@@ -1365,7 +1365,18 @@ final class SettingsStore {
             }
             return url
         } catch {
-            Log.sessionRepository.error("Failed to resolve notes folder bookmark: \(error, privacy: .public)")
+            // Security-scoped bookmarks are tied to the app's code signature,
+            // so ad-hoc rebuilds invalidate them. Drop the stale bookmark and
+            // re-create it from the configured path when possible.
+            Log.sessionRepository.error("Failed to resolve notes folder bookmark, re-creating: \(error, privacy: .public)")
+            defaults.removeObject(forKey: "notesFolderBookmark")
+            let folderURL = URL(fileURLWithPath: notesFolderPath)
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: folderURL.path, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                saveNotesFolderBookmark(from: folderURL)
+                return folderURL
+            }
             return nil
         }
     }
@@ -1507,8 +1518,10 @@ final class SettingsStore {
         self._removeFillerWords = defaults.bool(forKey: "removeFillerWords")
         self._saveAudioRecording = defaults.bool(forKey: "saveAudioRecording")
 
+        // Default off: voice-processing AEC can starve the system-audio process
+        // tap on some hardware (tap creates fine but delivers zero frames).
         if defaults.object(forKey: "enableEchoCancellation") == nil {
-            self._enableEchoCancellation = true
+            self._enableEchoCancellation = false
         } else {
             self._enableEchoCancellation = defaults.bool(forKey: "enableEchoCancellation")
         }

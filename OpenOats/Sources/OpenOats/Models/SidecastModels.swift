@@ -71,8 +71,7 @@ struct SidecastPersona: Identifiable, Codable, Sendable, Equatable {
             avatarTint: .green,
             verbosity: .short,
             cadence: .normal,
-            evidencePolicy: .required,
-            webSearchEnabled: true
+            evidencePolicy: .required
         ),
         SidecastPersona(
             name: "The Archivist",
@@ -82,8 +81,7 @@ struct SidecastPersona: Identifiable, Codable, Sendable, Equatable {
             avatarTint: .indigo,
             verbosity: .short,
             cadence: .normal,
-            evidencePolicy: .preferred,
-            webSearchEnabled: true
+            evidencePolicy: .preferred
         ),
         SidecastPersona(
             name: "The Sniper",

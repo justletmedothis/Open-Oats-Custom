@@ -309,8 +309,9 @@ final class SettingsStoreTests: XCTestCase {
 
     func testDefaultEnableEchoCancellation() {
         let store = makeStore()
-        // Defaults to true when key never set
-        XCTAssertTrue(store.enableEchoCancellation)
+        // Defaults to false when key never set: voice-processing AEC can
+        // starve the system-audio tap on some hardware.
+        XCTAssertFalse(store.enableEchoCancellation)
     }
 
     func testDefaultEnableBatchRetranscription() {

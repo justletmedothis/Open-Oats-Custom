@@ -80,7 +80,15 @@ final class MicCapture: @unchecked Sendable {
             if echoCancellation {
                 do {
                     try inputNode.setVoiceProcessingEnabled(true)
-                    Log.mic.info("Voice processing (AEC) enabled")
+                    // VPIO ducks other audio by default, which near-silences the
+                    // system-audio tap (≈ -50 dB) — the historical reason AEC and
+                    // the tap couldn't coexist. Disable ducking entirely.
+                    inputNode.voiceProcessingOtherAudioDuckingConfiguration =
+                        AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                            enableAdvancedDucking: false,
+                            duckingLevel: .min
+                        )
+                    Log.mic.info("Voice processing (AEC) enabled, ducking disabled")
                 } catch {
                     Log.mic.error("Failed to enable voice processing: \(error, privacy: .public)")
                 }
@@ -168,7 +176,14 @@ final class MicCapture: @unchecked Sendable {
                 }
 
                 guard !muted.value && !paused.value else { return }
-                continuation.yield(buffer)
+                // VPIO silently outputs multi-channel (up to 9ch) on some Macs
+                // with the processed signal on ch0 only — averaging the rest
+                // attenuates it badly downstream. Extract ch0 when AEC is on.
+                if echoCancellation {
+                    continuation.yield(Self.extractingChannelZeroIfMultichannel(buffer))
+                } else {
+                    continuation.yield(buffer)
+                }
             }
             self.hasTapInstalled = true
 
@@ -269,6 +284,27 @@ final class MicCapture: @unchecked Sendable {
         if retiredEngines.count > Self.maxRetiredEngineCount {
             retiredEngines.removeFirst(retiredEngines.count - Self.maxRetiredEngineCount)
         }
+    }
+
+    /// VPIO (voice processing) can deliver multi-channel buffers where only
+    /// channel 0 carries the processed signal. Extract it into a mono buffer
+    /// so downstream mono downmixes don't attenuate the voice.
+    private static func extractingChannelZeroIfMultichannel(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer {
+        let format = buffer.format
+        guard format.channelCount > 1,
+              format.commonFormat == .pcmFormatFloat32,
+              let src = buffer.floatChannelData else { return buffer }
+        let monoFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: format.sampleRate,
+            channels: 1,
+            interleaved: false
+        )!
+        guard let mono = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: buffer.frameCapacity),
+              let dst = mono.floatChannelData?[0] else { return buffer }
+        mono.frameLength = buffer.frameLength
+        memcpy(dst, src[0], Int(buffer.frameLength) * MemoryLayout<Float>.size)
+        return mono
     }
 
     private static func normalizedRMS(from buffer: AVAudioPCMBuffer) -> Float {

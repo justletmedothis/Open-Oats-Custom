@@ -268,12 +268,18 @@ struct SessionRecord: Codable {
     let suggestionID: UUID?
     let triggerUtteranceID: UUID?
     let suggestionLifecycle: SuggestionLifecycle?
+    /// Segment start/end in seconds relative to the recording start.
+    let startTime: TimeInterval?
+    let endTime: TimeInterval?
+    /// Capture channel that produced this record (mic vs system audio).
+    let source: AudioSource?
 
     enum CodingKeys: String, CodingKey {
         case speaker, text, timestamp, suggestions, kbHits
         case suggestionDecision, surfacedSuggestionText, conversationStateSummary
         case cleanedText = "refinedText"
         case suggestionID, triggerUtteranceID, suggestionLifecycle
+        case startTime, endTime, source
     }
 
     init(
@@ -288,7 +294,10 @@ struct SessionRecord: Codable {
         cleanedText: String? = nil,
         suggestionID: UUID? = nil,
         triggerUtteranceID: UUID? = nil,
-        suggestionLifecycle: SuggestionLifecycle? = nil
+        suggestionLifecycle: SuggestionLifecycle? = nil,
+        startTime: TimeInterval? = nil,
+        endTime: TimeInterval? = nil,
+        source: AudioSource? = nil
     ) {
         self.speaker = speaker
         self.text = text
@@ -302,6 +311,9 @@ struct SessionRecord: Codable {
         self.suggestionID = suggestionID
         self.triggerUtteranceID = triggerUtteranceID
         self.suggestionLifecycle = suggestionLifecycle
+        self.startTime = startTime
+        self.endTime = endTime
+        self.source = source
     }
 
     func withCleanedText(_ text: String?) -> SessionRecord {
@@ -314,7 +326,10 @@ struct SessionRecord: Codable {
             cleanedText: text,
             suggestionID: suggestionID,
             triggerUtteranceID: triggerUtteranceID,
-            suggestionLifecycle: suggestionLifecycle
+            suggestionLifecycle: suggestionLifecycle,
+            startTime: startTime,
+            endTime: endTime,
+            source: source
         )
     }
 
@@ -328,7 +343,10 @@ struct SessionRecord: Codable {
             cleanedText: cleanedText,
             suggestionID: suggestionID,
             triggerUtteranceID: triggerUtteranceID,
-            suggestionLifecycle: suggestionLifecycle
+            suggestionLifecycle: suggestionLifecycle,
+            startTime: startTime,
+            endTime: endTime,
+            source: source
         )
     }
 }

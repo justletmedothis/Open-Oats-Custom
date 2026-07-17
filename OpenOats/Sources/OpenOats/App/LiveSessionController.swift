@@ -14,6 +14,23 @@ struct RecordingHealthNotice: Equatable {
     let message: String
 }
 
+/// What a live capture channel is doing right now, for transcript-header
+/// status display. Ordered by display priority (worst state wins).
+enum LiveChannelActivity: Int, Equatable, Comparable {
+    /// No audible speech on the channel.
+    case idle = 0
+    /// Audible speech, no hypothesis text yet.
+    case hearing = 1
+    /// Volatile hypothesis text is flowing.
+    case transcribing = 2
+    /// Audible speech but the transcript stopped progressing (ASR lag).
+    case behind = 3
+
+    static func < (lhs: LiveChannelActivity, rhs: LiveChannelActivity) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
 /// Published state for the live session, projected by ContentView.
 /// Declared as @Observable class so SwiftUI tracks each property individually,
 /// preventing a full view-tree re-render whenever any single field changes.
@@ -45,6 +62,8 @@ final class LiveSessionState {
     var transcriptionPrompt: String = ""
     var modelDisplayName: String = ""
     var showLiveTranscript: Bool = true
+    /// Combined worst-case live activity across mic and system channels.
+    var liveChannelActivity: LiveChannelActivity = .idle
     var isMicMuted: Bool = false
     var isRecordingPaused: Bool = false
     var recordingHealthNotice: RecordingHealthNotice? = nil
@@ -1518,29 +1537,55 @@ final class LiveSessionController {
     static let liveTranscriptLagNotice =
         "Live transcription is falling behind. The full transcript is rebuilt automatically after the meeting."
 
+    /// Per-channel live status: lag flags plus the display activity.
+    private struct LiveChannelStatus {
+        var micLagging = false
+        var sysLagging = false
+        var activity: LiveChannelActivity = .idle
+
+        var isLagging: Bool { micLagging || sysLagging }
+    }
+
     @MainActor
-    private func liveLagNotice(isRunning: Bool, transcript: [Utterance]) -> String? {
+    private func liveChannelStatus(isRunning: Bool, transcript: [Utterance]) -> LiveChannelStatus {
         guard isRunning, let engine = coordinator.transcriptionEngine else {
             micLagTracker.reset()
             sysLagTracker.reset()
-            return nil
+            return LiveChannelStatus()
         }
         let now = Date()
         var remoteCount = 0
         for utterance in transcript where utterance.speaker.isRemote { remoteCount += 1 }
+        let micLevel = engine.micAudioLevel
+        let sysLevel = engine.systemAudioLevel
+        let volatileYou = coordinator.transcriptStore.volatileYouText
+        let volatileThem = coordinator.transcriptStore.volatileThemText
         let micLagging = micLagTracker.isLagging(
             now: now,
-            level: engine.micAudioLevel,
+            level: micLevel,
             progress: transcript.count - remoteCount,
-            volatileText: coordinator.transcriptStore.volatileYouText
+            volatileText: volatileYou
         )
         let sysLagging = sysLagTracker.isLagging(
             now: now,
-            level: engine.systemAudioLevel,
+            level: sysLevel,
             progress: remoteCount,
-            volatileText: coordinator.transcriptStore.volatileThemText
+            volatileText: volatileThem
         )
-        return micLagging || sysLagging ? Self.liveTranscriptLagNotice : nil
+        let micActivity = Self.channelActivity(level: micLevel, volatileText: volatileYou, isLagging: micLagging)
+        let sysActivity = Self.channelActivity(level: sysLevel, volatileText: volatileThem, isLagging: sysLagging)
+        return LiveChannelStatus(
+            micLagging: micLagging,
+            sysLagging: sysLagging,
+            activity: max(micActivity, sysActivity)
+        )
+    }
+
+    static func channelActivity(level: Float, volatileText: String, isLagging: Bool) -> LiveChannelActivity {
+        if isLagging { return .behind }
+        if !volatileText.isEmpty { return .transcribing }
+        if level >= ChannelLagTracker.speechLevel { return .hearing }
+        return .idle
     }
 
     @MainActor
@@ -1617,7 +1662,9 @@ final class LiveSessionController {
         let baseNotice = isRunning
             ? Self.liveTranscriptNotice(for: activeTranscriptionModel, issue: liveCloudIssue, isProcessing: liveCloudIsProcessing)
             : nil
-        set(\.liveTranscriptNotice, baseNotice ?? liveLagNotice(isRunning: isRunning, transcript: nextTranscript))
+        let channelStatus = liveChannelStatus(isRunning: isRunning, transcript: nextTranscript)
+        set(\.liveTranscriptNotice, baseNotice ?? (channelStatus.isLagging ? Self.liveTranscriptLagNotice : nil))
+        set(\.liveChannelActivity, channelStatus.activity)
         set(\.liveTranscriptEmptyStateMessage, isRunning ? Self.liveTranscriptEmptyStateMessage(for: activeTranscriptionModel, issue: liveCloudIssue, isProcessing: liveCloudIsProcessing) : nil)
         set(\.isMicMuted, coordinator.transcriptionEngine?.isMicMuted ?? false)
         set(\.isRecordingPaused, coordinator.transcriptionEngine?.isRecordingPaused ?? false)

@@ -9,6 +9,7 @@ struct TranscriptView: View {
 
     @State private var searchText = ""
     @State private var autoScrollEnabled = true
+    @State private var volatileScrollTask: Task<Void, Never>?
 
     private var filteredUtterances: [Utterance] {
         guard !searchText.isEmpty else { return utterances }
@@ -104,6 +105,7 @@ struct TranscriptView: View {
                                 showTimestamp: shouldShowTimestamp(at: index, in: visible)
                             )
                             .id(utterance.id)
+                            .transition(.opacity)
                         }
 
                         if !isSearching {
@@ -119,6 +121,10 @@ struct TranscriptView: View {
                         }
                     }
                     .padding(16)
+                    // Fade newly confirmed bubbles in rather than popping them;
+                    // confirmed text itself is never rewritten (see CHI 2023
+                    // caption-stability findings).
+                    .animation(.easeOut(duration: 0.2), value: visible.count)
                 }
             }
             .onChange(of: utterances.count) {
@@ -130,12 +136,10 @@ struct TranscriptView: View {
                 }
             }
             .onChange(of: volatileYouText) {
-                guard !isSearching, autoScrollEnabled else { return }
-                proxy.scrollTo("volatile-you", anchor: .bottom)
+                scheduleVolatileScroll(proxy: proxy, id: "volatile-you")
             }
             .onChange(of: volatileThemText) {
-                guard !isSearching, autoScrollEnabled else { return }
-                proxy.scrollTo("volatile-them", anchor: .bottom)
+                scheduleVolatileScroll(proxy: proxy, id: "volatile-them")
             }
             .onChange(of: searchText) {
                 if searchText.isEmpty, autoScrollEnabled, let last = utterances.last {
@@ -163,6 +167,19 @@ struct TranscriptView: View {
                     .transition(.opacity.combined(with: .scale))
                 }
             }
+        }
+    }
+
+    /// Coalesces rapid volatile-text updates (several can arrive within one
+    /// frame from the live recognizer) into a single scroll, avoiding
+    /// SwiftUI's multiple-updates-per-frame fault.
+    private func scheduleVolatileScroll(proxy: ScrollViewProxy, id: String) {
+        guard !isSearching, autoScrollEnabled else { return }
+        volatileScrollTask?.cancel()
+        volatileScrollTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled else { return }
+            proxy.scrollTo(id, anchor: .bottom)
         }
     }
 
@@ -211,9 +228,15 @@ private struct UtteranceBubble: View {
     }
 }
 
+/// Volatile (in-progress) hypothesis text, rendered inline where its final
+/// bubble will land: dimmed and italic so it reads as provisional, with
+/// interpolated content updates instead of flicker as the hypothesis is
+/// revised, and a pulsing dot while the channel is being recognized.
 private struct VolatileIndicator: View {
     let text: String
     let speaker: Speaker
+
+    @State private var pulsing = false
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -222,20 +245,22 @@ private struct VolatileIndicator: View {
 
             Text(speaker.displayLabel)
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(speaker.color)
+                .foregroundStyle(speaker.color.opacity(0.7))
                 .frame(minWidth: 36, alignment: .trailing)
 
-            HStack(spacing: 4) {
-                Text(text)
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                Circle()
-                    .fill(speaker.color)
-                    .frame(width: 4, height: 4)
-                    .opacity(0.6)
+            (Text(text).italic() + Text(" ●").font(.system(size: 8)).foregroundStyle(speaker.color.opacity(pulsing ? 0.9 : 0.25)))
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .contentTransition(.interpolate)
+                .animation(.easeOut(duration: 0.18), value: text)
+        }
+        .opacity(0.65)
+        .transition(.opacity)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) {
+                pulsing = true
             }
         }
-        .opacity(0.6)
     }
 }
 

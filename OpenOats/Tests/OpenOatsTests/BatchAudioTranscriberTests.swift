@@ -200,6 +200,60 @@ final class BatchAudioTranscriberTests: XCTestCase {
         XCTAssertEqual(slices.map(\.sampleCount), [36_800, 27_200])
     }
 
+    func testAbsorbThinMicSpeakersReassignsToNearestSurvivor() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let records = [
+            SessionRecord(speaker: .local(1), text: "long talker one", timestamp: base),
+            SessionRecord(speaker: .local(2), text: "mm-hm", timestamp: base.addingTimeInterval(5)),
+            SessionRecord(speaker: .local(1), text: "long talker two", timestamp: base.addingTimeInterval(10)),
+        ]
+        // Speaker index 0 has 20s of speech; index 1 only 0.8s (below floor).
+        let segments: [Int: [DiarizationManager.SpeakerSegment]] = [
+            0: [.init(start: 0, end: 20)],
+            1: [.init(start: 4.8, end: 5.6)],
+        ]
+        let absorbed = BatchAudioTranscriber.absorbThinMicSpeakers(
+            in: records, speakerSegments: segments, excluding: nil
+        )
+        XCTAssertEqual(absorbed.map(\.speaker), [.local(1), .local(1), .local(1)],
+                       "thin cluster's line joins the nearest substantial speaker")
+    }
+
+    func testAbsorbThinMicSpeakersKeepsAllWhenNoSurvivor() {
+        // Both voices are thin (a very short session): nothing is absorbed.
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let records = [
+            SessionRecord(speaker: .local(1), text: "hi", timestamp: base),
+            SessionRecord(speaker: .local(2), text: "hey", timestamp: base.addingTimeInterval(2)),
+        ]
+        let segments: [Int: [DiarizationManager.SpeakerSegment]] = [
+            0: [.init(start: 0, end: 1)],
+            1: [.init(start: 2, end: 3)],
+        ]
+        let absorbed = BatchAudioTranscriber.absorbThinMicSpeakers(
+            in: records, speakerSegments: segments, excluding: nil
+        )
+        XCTAssertEqual(absorbed.map(\.speaker), [.local(1), .local(2)])
+    }
+
+    func testAbsorbThinMicSpeakersNeverAbsorbsSelf() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let records = [
+            SessionRecord(speaker: .local(1), text: "guest", timestamp: base),
+            SessionRecord(speaker: .local(2), text: "brief self comment", timestamp: base.addingTimeInterval(5)),
+        ]
+        // Index 1 is the enrolled self voice with little speech; it must keep
+        // its records so the voiceprint relabel can claim them.
+        let segments: [Int: [DiarizationManager.SpeakerSegment]] = [
+            0: [.init(start: 0, end: 20)],
+            1: [.init(start: 5, end: 6)],
+        ]
+        let absorbed = BatchAudioTranscriber.absorbThinMicSpeakers(
+            in: records, speakerSegments: segments, excluding: 1
+        )
+        XCTAssertEqual(absorbed.map(\.speaker), [.local(1), .local(2)])
+    }
+
     private func makeRecords(
         count: Int,
         startedAt: Date,

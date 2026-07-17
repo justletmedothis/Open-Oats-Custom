@@ -578,6 +578,7 @@ actor BatchAudioTranscriber {
 
         var micSelfIndex: Int?
         var micSpeakerSegments: [Int: [DiarizationManager.SpeakerSegment]]?
+        var micSpeakerEmbeddings: [Int: [Float]] = [:]
         var sysSpeechRanges: [(start: Date, end: Date)] = []
 
         if let micURL = urls.mic {
@@ -617,6 +618,15 @@ actor BatchAudioTranscriber {
                         }
                     }
                 }
+
+                // Extract per-speaker embeddings while the samples are still in
+                // memory — they feed speaker-library auto-naming and "Remember
+                // this voice" enrollment after the transcript is saved.
+                micSpeakerEmbeddings = await SelfVoiceIdentifier.speakerEmbeddings(
+                    samples: samples,
+                    speakerSegments: segments,
+                    excluding: micSelfIndex
+                )
             }
 
             micRecords = try await transcribeFile(
@@ -721,6 +731,44 @@ actor BatchAudioTranscriber {
                 Log.batchTranscription.info("Dropped \(before - micRecords.count, privacy: .public) mic records from \(echoIndices.count, privacy: .public) diarized voice(s) identified as call-audio echo")
             }
         }
+        // A diarized mic voice with almost no speech across the whole session
+        // is noise or bleed, not a participant: absorb its records into the
+        // nearest surviving mic speaker instead of minting a letter for it.
+        if let segments = micSpeakerSegments {
+            micRecords = Self.absorbThinMicSpeakers(
+                in: micRecords,
+                speakerSegments: segments,
+                excluding: micSelfIndex
+            )
+        }
+
+        // Reproduce the letter mapping relabelSelfSpeaker/reletterLocalSpeakers
+        // are about to apply, so speaker embeddings can be keyed by the final
+        // letters the user actually sees (echo-dropped voices fall out here).
+        let preRelabelLocalNumbers = Set(
+            micRecords.compactMap { record -> Int? in
+                guard case .local(let n) = record.speaker else { return nil }
+                return n
+            }
+        ).sorted()
+        var finalNumberByOriginal: [Int: Int] = [:]
+        if let selfIndex = micSelfIndex {
+            var offset = 0
+            for n in preRelabelLocalNumbers where n != selfIndex + 1 {
+                offset += 1
+                finalNumberByOriginal[n] = offset
+            }
+        } else {
+            for (offset, n) in preRelabelLocalNumbers.enumerated() {
+                finalNumberByOriginal[n] = offset + 1
+            }
+        }
+        var speakerKeyEmbeddings: [String: [Float]] = [:]
+        for (index, embedding) in micSpeakerEmbeddings {
+            guard let finalNumber = finalNumberByOriginal[index + 1] else { continue }
+            speakerKeyEmbeddings[Speaker.local(finalNumber).storageKey] = embedding
+        }
+
         if let selfIndex = micSelfIndex {
             micRecords = Self.relabelSelfSpeaker(in: micRecords, selfIndex: selfIndex)
         } else {
@@ -768,6 +816,28 @@ actor BatchAudioTranscriber {
         )
         // Retain batch stems/metadata for a bounded rerun/debug window.
         // SessionRepository purges expired retained assets on startup.
+
+        // Persist per-speaker embeddings ("Remember this voice" enrollment)
+        // and auto-name lettered speakers recognized from the library. Runs
+        // after the save so auto-names land on top of the pruned name map.
+        if !speakerKeyEmbeddings.isEmpty {
+            await sessionRepository.saveSpeakerEmbeddings(sessionID: sessionID, embeddings: speakerKeyEmbeddings)
+            let profiles = SpeakerLibraryStore.load()
+            if !profiles.isEmpty {
+                var autoNames: [String: String] = [:]
+                for (key, embedding) in speakerKeyEmbeddings {
+                    guard let profile = SpeakerLibraryStore.match(embedding: embedding, in: profiles) else { continue }
+                    autoNames[key] = profile.name
+                    // Reinforce the centroid so the voiceprint tracks the
+                    // speaker across mics and meetings.
+                    SpeakerLibraryStore.addSample(name: profile.name, embedding: embedding)
+                }
+                if !autoNames.isEmpty {
+                    Log.batchTranscription.info("Auto-named \(autoNames.count, privacy: .public) speaker(s) from the voice library")
+                    await sessionRepository.mergeSessionSpeakerNames(sessionID: sessionID, adding: autoNames)
+                }
+            }
+        }
 
         status = .completed(sessionID: sessionID)
         DiagnosticsSupport.record(category: "batch", message: "Batch transcription completed for \(sessionID) records=\(allRecords.count)")
@@ -989,6 +1059,54 @@ actor BatchAudioTranscriber {
         return records.map { record in
             guard let mapped = mapping[record.speaker] else { return record }
             return record.withSpeaker(mapped)
+        }
+    }
+
+    /// Reassigns records of diarized mic voices that spoke less than
+    /// `minimumSpeechSeconds` across the whole session to the nearest
+    /// surviving mic speaker by timestamp. A cluster that thin is noise, an
+    /// interjection fragment, or bleed, and its embedding is too short to be
+    /// reliable; production diarizers gate new speakers the same way
+    /// (pyannote min_cluster_size). The enrolled self voice is never absorbed,
+    /// and nothing happens unless at least one substantial voice survives.
+    static func absorbThinMicSpeakers(
+        in records: [SessionRecord],
+        speakerSegments: [Int: [DiarizationManager.SpeakerSegment]],
+        excluding selfIndex: Int?,
+        minimumSpeechSeconds: Float = 2.5
+    ) -> [SessionRecord] {
+        var totals: [Int: Float] = [:]
+        for (index, segments) in speakerSegments {
+            totals[index] = segments.reduce(0) { $0 + max(0, $1.end - $1.start) }
+        }
+
+        let thinSpeakers = Set(
+            totals.compactMap { index, total -> Speaker? in
+                guard index != selfIndex, total < minimumSpeechSeconds else { return nil }
+                return Speaker.local(index + 1)
+            }
+        )
+        guard !thinSpeakers.isEmpty else { return records }
+
+        // Donors: mic records attributed to a voice with real evidence
+        // (a surviving lettered speaker, or the user).
+        let donors = records.filter { record in
+            switch record.speaker {
+            case .you: true
+            case .local: !thinSpeakers.contains(record.speaker)
+            case .them, .remote: false
+            }
+        }
+        guard !donors.isEmpty else { return records }
+
+        return records.map { record in
+            guard thinSpeakers.contains(record.speaker) else { return record }
+            let nearest = donors.min {
+                abs($0.timestamp.timeIntervalSince(record.timestamp))
+                    < abs($1.timestamp.timeIntervalSince(record.timestamp))
+            }
+            guard let nearest else { return record }
+            return record.withSpeaker(nearest.speaker)
         }
     }
 

@@ -1044,6 +1044,68 @@ final class NotesController {
         }
     }
 
+    /// Reassigns a single transcript line to a different speaker (post-meeting
+    /// correction from the transcript row's context menu).
+    func reassignUtteranceSpeaker(sessionID: String, record: SessionRecord, to speaker: Speaker) {
+        Task {
+            await coordinator.sessionRepository.reassignSpeaker(
+                sessionID: sessionID,
+                fromKey: record.speaker.storageKey,
+                to: speaker,
+                onlyTimestamp: record.timestamp
+            )
+            await reloadTranscript(sessionID: sessionID)
+        }
+    }
+
+    /// Relabels every line of a mislabeled speaker as the user and, when the
+    /// batch pass stored an embedding for that cluster, blends it into the
+    /// enrolled voiceprint (distance-gated) so the same mistake gets rarer.
+    func relabelSpeakerAsMe(sessionID: String, speakerKey: String) {
+        Task {
+            let embeddings = await coordinator.sessionRepository.loadSpeakerEmbeddings(sessionID: sessionID)
+            if let embedding = embeddings[speakerKey] {
+                VoiceprintStore.reinforce(with: embedding)
+            }
+            await coordinator.sessionRepository.reassignSpeaker(
+                sessionID: sessionID, fromKey: speakerKey, to: .you
+            )
+            await loadHistory()
+            await reloadTranscript(sessionID: sessionID)
+        }
+    }
+
+    /// Merges one diarized speaker into another (they were the same person).
+    func mergeSpeaker(sessionID: String, fromKey: String, into speaker: Speaker) {
+        Task {
+            await coordinator.sessionRepository.reassignSpeaker(
+                sessionID: sessionID, fromKey: fromKey, to: speaker
+            )
+            await loadHistory()
+            await reloadTranscript(sessionID: sessionID)
+        }
+    }
+
+    private func reloadTranscript(sessionID: String) async {
+        guard state.selectedSessionID == sessionID else { return }
+        state.loadedTranscript = await coordinator.sessionRepository.loadTranscript(sessionID: sessionID)
+    }
+
+    /// Saves the voice behind a renamed speaker into the persistent library so
+    /// future meetings auto-name them. Uses the embeddings sidecar written by
+    /// the batch pass; a no-op when no embedding exists for the speaker.
+    func rememberSpeakerVoice(sessionID: String, speakerKey: String, name: String) {
+        Task {
+            let embeddings = await coordinator.sessionRepository.loadSpeakerEmbeddings(sessionID: sessionID)
+            guard let embedding = embeddings[speakerKey] else {
+                Log.diarization.info("No stored embedding for \(speakerKey, privacy: .public); voice not remembered")
+                return
+            }
+            SpeakerLibraryStore.addSample(name: name, embedding: embedding)
+            Log.diarization.info("Remembered voice for \(speakerKey, privacy: .public) in the speaker library")
+        }
+    }
+
     func setTagFilter(_ tag: String?) {
         state.tagFilter = tag
     }

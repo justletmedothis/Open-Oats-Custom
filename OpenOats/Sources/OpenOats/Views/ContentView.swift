@@ -128,7 +128,7 @@ struct ContentView: View {
                 if controllerState.showLiveTranscript {
                     DisclosureGroup(isExpanded: $isTranscriptExpanded) {
                         IsolatedTranscriptWrapper(state: controllerState)
-                            .frame(height: 150)
+                            .frame(height: 210)
                     } label: {
                         HStack(spacing: 6) {
                             Text("Transcript")
@@ -138,6 +138,7 @@ struct ContentView: View {
                                     .font(.system(size: 11))
                                     .foregroundStyle(.tertiary)
                             }
+                            LiveActivityChip(activity: controllerState.liveChannelActivity)
                             if let liveTranscriptNotice = controllerState.liveTranscriptNotice {
                                 Text("·")
                                     .font(.system(size: 11))
@@ -719,14 +720,55 @@ private struct ScratchpadSection: View {
 
 private struct IsolatedTranscriptWrapper: View {
     let state: LiveSessionState
-    
+
     var body: some View {
         TranscriptView(
             utterances: state.liveTranscript,
             emptyStateMessage: state.liveTranscriptEmptyStateMessage,
             volatileYouText: state.volatileYouText,
-            volatileThemText: state.volatileThemText
+            volatileThemText: state.volatileThemText,
+            showSearch: true
         )
+    }
+}
+
+/// Compact live status for the transcript header: what the recognizer is
+/// doing right now (listening / hearing audio / transcribing / catching up).
+private struct LiveActivityChip: View {
+    let activity: LiveChannelActivity
+
+    private var color: Color {
+        switch activity {
+        case .idle: .secondary.opacity(0.5)
+        case .hearing: Color.accentTeal
+        case .transcribing: .green
+        case .behind: .orange
+        }
+    }
+
+    private var label: String {
+        switch activity {
+        case .idle: "Listening"
+        case .hearing: "Hearing audio"
+        case .transcribing: "Transcribing"
+        case .behind: "Catching up…"
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 5, height: 5)
+                .opacity(activity == .idle ? 0.6 : 1)
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(color.opacity(0.12)))
+        .animation(.easeInOut(duration: 0.25), value: activity)
     }
 }
 

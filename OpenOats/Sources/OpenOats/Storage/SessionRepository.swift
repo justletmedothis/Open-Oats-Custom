@@ -325,7 +325,10 @@ actor SessionRepository {
             speaker: utterance.speaker,
             text: utterance.text,
             timestamp: utterance.timestamp,
-            cleanedText: utterance.cleanedText
+            cleanedText: utterance.cleanedText,
+            startTime: utterance.startTime,
+            endTime: utterance.endTime,
+            source: utterance.source
         )
 
         if metadata.isDelayed {
@@ -398,7 +401,10 @@ actor SessionRepository {
                 cleanedText: cleanedText,
                 suggestionID: snapshot?.suggestionID,
                 triggerUtteranceID: snapshot?.triggerUtteranceID,
-                suggestionLifecycle: snapshot?.lifecycle
+                suggestionLifecycle: snapshot?.lifecycle,
+                startTime: baseRecord.startTime,
+                endTime: baseRecord.endTime,
+                source: baseRecord.source
             )
 
             await self.appendRecord(enrichedRecord)
@@ -1057,6 +1063,106 @@ actor SessionRepository {
         // The mirrored markdown renders speaker names; rewrite it so renames
         // don't leave stale labels on disk.
         scheduleMirror(sessionID: sessionID)
+    }
+
+    /// Adds speaker names without overwriting names the user already set.
+    /// Used by batch auto-naming from the speaker library.
+    func mergeSessionSpeakerNames(sessionID: String, adding names: [String: String]) {
+        guard !names.isEmpty, var meta = loadSessionMetadataFile(sessionID: sessionID) else { return }
+        var merged = meta.speakerNames ?? [:]
+        for (key, value) in names where merged[key] == nil {
+            merged[key] = value
+        }
+        guard merged != meta.speakerNames ?? [:] else { return }
+        meta.speakerNames = merged.isEmpty ? nil : merged
+        writeSessionMetadata(meta, sessionID: sessionID)
+        scheduleMirror(sessionID: sessionID)
+    }
+
+    // MARK: - Speaker Reassignment
+
+    /// Rewrites speaker attribution on transcript records after the fact
+    /// (post-meeting corrections from the transcript view). When
+    /// `onlyTimestamp` is set, only the record matching that timestamp and
+    /// `fromKey` changes; otherwise every record with `fromKey` changes.
+    /// Rewrites the authoritative JSONL (final if present, else live), keeps a
+    /// one-time backup of the pre-correction file, carries the speakerNames map
+    /// along (a full relabel moves/drops the old key's name), and re-mirrors.
+    func reassignSpeaker(
+        sessionID: String,
+        fromKey: String,
+        to newSpeaker: Speaker,
+        onlyTimestamp: Date? = nil
+    ) {
+        let dir = sessionDirectory(for: sessionID)
+        let finalURL = dir.appendingPathComponent("transcript.final.jsonl")
+        let liveURL = dir.appendingPathComponent("transcript.live.jsonl")
+        let file = FileManager.default.fileExists(atPath: finalURL.path) ? finalURL : liveURL
+        guard let content = try? String(contentsOf: file, encoding: .utf8) else { return }
+
+        let backupURL = file.appendingPathExtension("pre-reassign.bak")
+        if !FileManager.default.fileExists(atPath: backupURL.path) {
+            try? FileManager.default.copyItem(at: file, to: backupURL)
+        }
+
+        var updatedLines: [String] = []
+        var anyUpdated = false
+        for line in content.components(separatedBy: "\n") where !line.isEmpty {
+            guard let data = line.data(using: .utf8),
+                  let record = try? decoder.decode(SessionRecord.self, from: data),
+                  record.speaker.storageKey == fromKey,
+                  onlyTimestamp == nil || record.timestamp == onlyTimestamp,
+                  let encoded = try? encoder.encode(record.withSpeaker(newSpeaker)),
+                  let jsonString = String(data: encoded, encoding: .utf8)
+            else {
+                updatedLines.append(line)
+                continue
+            }
+            updatedLines.append(jsonString)
+            anyUpdated = true
+        }
+        guard anyUpdated else { return }
+        try? (updatedLines.joined(separator: "\n") + "\n")
+            .write(to: file, atomically: true, encoding: .utf8)
+
+        // A full relabel retires fromKey: move its custom name onto the target
+        // (when the target is renameable and unnamed) and drop the stale entry.
+        if onlyTimestamp == nil, var meta = loadSessionMetadataFile(sessionID: sessionID),
+           var names = meta.speakerNames, names[fromKey] != nil {
+            let movedName = names.removeValue(forKey: fromKey)
+            let newKey = newSpeaker.storageKey
+            if newSpeaker.isRenameable, names[newKey] == nil, let movedName {
+                names[newKey] = movedName
+            }
+            meta.speakerNames = names.isEmpty ? nil : names
+            writeSessionMetadata(meta, sessionID: sessionID)
+        }
+
+        scheduleMirror(sessionID: sessionID)
+    }
+
+    // MARK: - Speaker Embeddings Sidecar
+
+    /// Per-speaker voice embeddings from the batch pass, keyed by the final
+    /// speaker storageKey (e.g. "local_1"). Enables "Remember this voice"
+    /// enrollment from the rename popover without retaining audio.
+    func saveSpeakerEmbeddings(sessionID: String, embeddings: [String: [Float]]) {
+        let dir = sessionDirectory(for: sessionID)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("speaker_embeddings.json")
+        do {
+            let data = try JSONEncoder().encode(embeddings)
+            try data.write(to: url, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            Log.sessionRepository.error("Failed to write speaker embeddings: \(error, privacy: .public)")
+        }
+    }
+
+    func loadSpeakerEmbeddings(sessionID: String) -> [String: [Float]] {
+        let url = sessionDirectory(for: sessionID).appendingPathComponent("speaker_embeddings.json")
+        guard let data = try? Data(contentsOf: url) else { return [:] }
+        return (try? JSONDecoder().decode([String: [Float]].self, from: data)) ?? [:]
     }
 
     func updateSessionCalendarEvent(sessionID: String, calendarEvent: CalendarEvent?) {

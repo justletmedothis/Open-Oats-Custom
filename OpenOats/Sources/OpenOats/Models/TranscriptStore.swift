@@ -57,6 +57,17 @@ final class TranscriptStore {
         utterancesSinceStateUpdate >= 2
     }
 
+    /// Rewrites the speaker on already-appended utterances. Used when live
+    /// voiceprint matching identifies a lettered mic speaker as the user, so
+    /// their earlier bubbles catch up. In-memory/live view only — the batch
+    /// pass rebuilds the persisted transcript with the same relabeling logic.
+    func relabel(from oldSpeaker: Speaker, to newSpeaker: Speaker) {
+        guard utterances.contains(where: { $0.speaker == oldSpeaker }) else { return }
+        utterances = utterances.map {
+            $0.speaker == oldSpeaker ? $0.withSpeaker(newSpeaker) : $0
+        }
+    }
+
     @discardableResult
     func append(_ utterance: Utterance) -> Bool {
         guard !shouldSuppressAcousticEcho(utterance) else { return false }

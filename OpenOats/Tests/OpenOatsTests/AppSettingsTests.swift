@@ -70,10 +70,12 @@ final class AppSettingsTests: XCTestCase {
 
     func testTranscriptionModelAllCases() {
         let cases = TranscriptionModel.allCases
-        XCTAssertEqual(cases.count, 9)
+        XCTAssertEqual(cases.count, 10)
+        XCTAssertTrue(cases.contains(.appleSpeech))
     }
 
     func testTranscriptionModelDisplayNames() {
+        XCTAssertEqual(TranscriptionModel.appleSpeech.displayName, "Apple Speech")
         XCTAssertEqual(TranscriptionModel.parakeetV2.displayName, "Parakeet TDT v2")
         XCTAssertEqual(TranscriptionModel.parakeetV3.displayName, "Parakeet TDT v3")
         XCTAssertEqual(TranscriptionModel.qwen3ASR06B.displayName, "Qwen3 ASR 0.6B")

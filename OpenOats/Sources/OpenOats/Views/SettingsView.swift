@@ -397,6 +397,7 @@ private struct TranscriptionSettingsTab: View {
     @State private var cohereValidation: APIKeyValidator.ValidationResult?
     @State private var cohereValidationTask: Task<Void, Never>?
     @State private var voiceEnrollment = VoiceEnrollmentController()
+    @State private var savedVoices: [SpeakerProfile] = []
 
     var body: some View {
         ScrollView {
@@ -443,7 +444,7 @@ private struct TranscriptionSettingsTab: View {
 
                     Toggle("Echo cancellation", isOn: $settings.enableEchoCancellation)
                         .font(.system(size: 12))
-                    Text("Reduces duplicate transcription when using speakers and microphone simultaneously. Currently disabled during recording because it conflicts with system audio capture on macOS.")
+                    Text("Experimental: removes meeting audio playing through your speakers from the microphone, so remote voices aren't double-transcribed or mistaken for people in the room. On some Macs this silences system-audio capture entirely. If system audio or the microphone stops being transcribed with this on, turn it off.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
@@ -451,7 +452,7 @@ private struct TranscriptionSettingsTab: View {
                 Section("Transcription") {
                     Picker("Model", selection: $settings.transcriptionModel) {
                         Section("Local") {
-                            ForEach(TranscriptionModel.allCases.filter { !$0.isCloud }) { model in
+                            ForEach(TranscriptionModel.allCases.filter { !$0.isCloud && $0.isAvailableOnThisMac }) { model in
                                 Text(model.displayName).tag(model)
                             }
                         }
@@ -631,6 +632,10 @@ private struct TranscriptionSettingsTab: View {
                         }
                         .font(.system(size: 12))
                     }
+
+                    if settings.enableMicDiarization {
+                        savedVoicesRows
+                    }
                 }
             }
             .formStyle(.grouped)
@@ -713,6 +718,41 @@ private struct TranscriptionSettingsTab: View {
         voiceEnrollment.startRecording(
             inputDeviceID: settings.inputDeviceID > 0 ? settings.inputDeviceID : nil
         )
+    }
+
+    /// The persistent named-voice library: people remembered via "Remember
+    /// this voice" in the transcript's rename popover.
+    @ViewBuilder
+    private var savedVoicesRows: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if savedVoices.isEmpty {
+                Text("Saved voices: none yet. Rename a lettered speaker in a transcript and turn on \"Remember this voice\" to auto-name them in future meetings.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Saved voices")
+                    .font(.system(size: 12, weight: .medium))
+                ForEach(savedVoices) { profile in
+                    HStack {
+                        Text(profile.name)
+                            .font(.system(size: 12))
+                        Text("\(profile.sampleCount) sample\(profile.sampleCount == 1 ? "" : "s") · updated \(profile.updatedAt.formatted(date: .abbreviated, time: .omitted))")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
+                        Spacer()
+                        Button("Forget") {
+                            SpeakerLibraryStore.delete(id: profile.id)
+                            savedVoices = SpeakerLibraryStore.load()
+                        }
+                        .font(.system(size: 12))
+                    }
+                }
+                Text("Voices recognized in future meetings are auto-named. Everything stays on this Mac.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .onAppear { savedVoices = SpeakerLibraryStore.load() }
     }
 
     @ViewBuilder

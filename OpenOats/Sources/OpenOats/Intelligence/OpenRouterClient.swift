@@ -127,8 +127,11 @@ actor OpenRouterClient {
         model: String,
         messages: [Message],
         maxTokens: Int = 1024,
+        temperature: Double? = nil,
         baseURL: URL? = nil,
-        transport: CompletionTransport = .chatCompletions
+        webSearch: Bool = false,
+        transport: CompletionTransport = .chatCompletions,
+        requestTimeout: TimeInterval = 300
     ) -> AsyncThrowingStream<String, Error> {
         if transport == .anthropicMessages {
             return streamAnthropicCompletion(
@@ -136,7 +139,9 @@ actor OpenRouterClient {
                 model: model,
                 messages: messages,
                 maxTokens: maxTokens,
-                baseURL: baseURL
+                temperature: temperature,
+                baseURL: baseURL,
+                requestTimeout: requestTimeout
             )
         }
 
@@ -155,16 +160,17 @@ actor OpenRouterClient {
                         stream: true,
                         max_tokens: useNewParam ? nil : maxTokens,
                         max_completion_tokens: useNewParam ? maxTokens : nil,
-                        temperature: nil,
-                        plugins: nil
+                        temperature: temperature,
+                        plugins: webSearch ? [.default] : nil
                     )
 
                     var urlRequest = URLRequest(url: targetURL)
                     urlRequest.httpMethod = "POST"
                     // Idle timeout between streamed bytes. Must cover cold-start of local models
                     // (Ollama/MLX) and first-token latency of reasoning models, which routinely
-                    // exceed URLRequest's 60s default.
-                    urlRequest.timeoutInterval = 300
+                    // exceed URLRequest's 60s default. Callers with live UI (Sidecast) pass a
+                    // tighter budget.
+                    urlRequest.timeoutInterval = requestTimeout
                     urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     if let apiKey, !apiKey.isEmpty {
                         urlRequest.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -279,7 +285,9 @@ actor OpenRouterClient {
         model: String,
         messages: [Message],
         maxTokens: Int,
-        baseURL: URL?
+        temperature: Double? = nil,
+        baseURL: URL?,
+        requestTimeout: TimeInterval = 300
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream<String, Error> { continuation in
             let task = Task {
@@ -295,13 +303,13 @@ actor OpenRouterClient {
                         max_tokens: maxTokens,
                         messages: Self.anthropicMessages(from: messages),
                         stream: true,
-                        temperature: nil,
+                        temperature: temperature,
                         system: Self.anthropicSystemPrompt(from: messages)
                     )
 
                     var urlRequest = URLRequest(url: targetURL)
                     urlRequest.httpMethod = "POST"
-                    urlRequest.timeoutInterval = 300
+                    urlRequest.timeoutInterval = requestTimeout
                     urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     urlRequest.setValue(apiKey, forHTTPHeaderField: "x-api-key")
                     urlRequest.setValue(Self.anthropicVersion, forHTTPHeaderField: "anthropic-version")
