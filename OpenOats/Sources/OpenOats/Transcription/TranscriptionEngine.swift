@@ -203,6 +203,12 @@ final class TranscriptionEngine {
 
     private var micTask: Task<Void, Never>?
     private var sysTask: Task<Void, Never>?
+
+    /// Incremented when a session ends. Live-transcriber callbacks capture the
+    /// epoch at creation and are dropped if it changed, so a transcriber that
+    /// outlives its session (abandoned wedged teardown, late XPC results)
+    /// cannot append into an idle store or the next session's transcript.
+    private var liveEpoch = 0
     /// Keeps the mic stream alive for the audio level meter when transcription isn't running.
     private var micKeepAliveTask: Task<Void, Never>?
 
@@ -550,6 +556,24 @@ final class TranscriptionEngine {
             return
         }
 
+        // A stop that raced this start (finalize flips isRunning false while
+        // models were loading) must abort here: continuing would start capture
+        // for a session that already ended — a hot mic behind an idle UI, and
+        // an engine that then refuses every future start.
+        guard isRunning, !Task.isCancelled else {
+            Log.transcription.info("start() aborted: session ended during model loading")
+            micBackend = nil
+            systemBackend = nil
+            self.vadManager = nil
+            diarizationManager = nil
+            micDiarizationManager = nil
+            selfVoiceMatcher = nil
+            activeTranscriptionSession = nil
+            assetStatus = "Ready"
+            isRunning = false
+            return
+        }
+
         // 2. Start mic capture
         userSelectedDeviceID = inputDeviceID
         guard let targetMicID = resolvedMicDeviceID(for: inputDeviceID) else {
@@ -606,7 +630,10 @@ final class TranscriptionEngine {
             case .retryCapture:
                 Log.transcription.error("No mic audio after 5s, retrying mic capture once")
                 self.micCapture.finishStream()
-                await self.micTask?.value
+                if await Self.awaitTeardown(of: [self.micTask].compactMap { $0 }, timeoutSeconds: 10) == false {
+                    Log.transcription.error("Mic transcriber teardown timed out during startup retry; abandoning")
+                    self.micTask?.cancel()
+                }
                 self.micTask = nil
                 self.micCapture.stop()
                 self.startMicStream(
@@ -636,6 +663,25 @@ final class TranscriptionEngine {
 
         // 3. Start system audio capture
         await startSystemAudioStream(locale: locale, vadManager: vadManager)
+
+        // Same race, later window: a stop that landed while the system tap was
+        // starting already tore down what existed then; nothing started after
+        // may outlive it.
+        guard isRunning, !Task.isCancelled else {
+            Log.transcription.info("start() aborted: session ended during capture startup")
+            micTask?.cancel()
+            sysTask?.cancel()
+            micCapture.finishStream()
+            systemCapture.finishStream()
+            micTask = nil
+            sysTask = nil
+            micCapture.stop()
+            Task { await self.systemCapture.stop() }
+            activeTranscriptionSession = nil
+            assetStatus = "Ready"
+            isRunning = false
+            return
+        }
 
         assetStatus = "Transcribing (\(micBackend?.displayName ?? transcriptionModel.displayName))"
         Log.transcription.info("All transcription tasks started")
@@ -786,6 +832,10 @@ final class TranscriptionEngine {
             return
         }
 
+        // The live status otherwise reads "Transcribing (…)" until teardown
+        // completes, which looks like a stuck transcription during stop.
+        assetStatus = "Finishing up..."
+
         removeDefaultDeviceListener()
         removeDefaultOutputDeviceListener()
         micRestartTask?.cancel()
@@ -803,28 +853,33 @@ final class TranscriptionEngine {
         sysTask?.cancel()
         micCapture.finishStream()
         systemCapture.finishStream()
-        await micTask?.value
-        await sysTask?.value
+        let teardownFinished = await Self.awaitTeardown(
+            of: [micTask, sysTask].compactMap { $0 },
+            timeoutSeconds: 5
+        )
+        if !teardownFinished {
+            Log.transcription.error("Live transcriber teardown timed out; abandoning tasks")
+            DiagnosticsSupport.record(
+                category: "meeting",
+                message: "Transcriber teardown timed out after 5s; abandoned"
+            )
+        }
 
-        micCapture.stop()
-        await systemCapture.stop()
-
+        // Reset engine state BEFORE the hardware/diarizer teardown below: any
+        // of those awaits wedging must never leave isRunning stuck true (which
+        // silently refuses every subsequent start until relaunch). liveEpoch
+        // invalidates the abandoned transcribers' late callbacks.
+        liveEpoch += 1
         micTask = nil
         sysTask = nil
         pendingMicDeviceID = nil
         micKeepAliveTask = nil
         currentMicDeviceID = 0
-        // Finalize and release diarization managers
-        if let dm = diarizationManager {
-            await dm.finalize()
-        }
+        let doomedSystemCapture = systemCapture
+        let doomedManagers = [diarizationManager, micDiarizationManager].compactMap { $0 }
         diarizationManager = nil
-        if let dm = micDiarizationManager {
-            await dm.finalize()
-        }
         micDiarizationManager = nil
         selfVoiceMatcher = nil
-
         micBackend = nil
         systemBackend = nil
         vadManager = nil
@@ -833,9 +888,71 @@ final class TranscriptionEngine {
         liveCloudTranscriptIssue = nil
         liveCloudTranscriptionIsProcessing = false
         preparedCloudStartBackend = nil
+        clearDownloadTracking()
         activeTranscriptionSession = nil
         isRunning = false
         assetStatus = "Ready"
+
+        // Mic teardown is synchronous MainActor work (fast in practice); the
+        // system tap teardown crosses XPC into coreaudiod and the diarizer
+        // finalize can sit behind an inference call, so both are bounded and
+        // abandoned on timeout rather than trusted to return.
+        micCapture.stop()
+        let hardwareTeardown = Task.detached {
+            await doomedSystemCapture.stop()
+            for dm in doomedManagers {
+                await dm.finalize()
+            }
+        }
+        let hardwareFinished = await Self.awaitTeardown(
+            of: [hardwareTeardown],
+            timeoutSeconds: 10
+        )
+        if !hardwareFinished {
+            Log.transcription.error("System capture/diarizer teardown timed out; abandoning")
+            DiagnosticsSupport.record(
+                category: "meeting",
+                message: "Capture teardown timed out after 10s; abandoned"
+            )
+        }
+    }
+
+    /// Await the given tasks, giving up after `timeoutSeconds`. A wedged live
+    /// transcriber (SpeechTranscriber's results stream has been observed to
+    /// never terminate after cancellation) must not hang finalize: the
+    /// coordinator's watchdog only resets UI state, so a hung finalize left
+    /// `isRunning` stuck true and the engine permanently unable to record
+    /// until relaunch. Returns false when the tasks were abandoned.
+    nonisolated static func awaitTeardown(
+        of tasks: [Task<Void, Never>],
+        timeoutSeconds: Double
+    ) async -> Bool {
+        guard !tasks.isEmpty else { return true }
+        final class ResumeOnce: @unchecked Sendable {
+            private let lock = NSLock()
+            private var resumed = false
+            func claim() -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                if resumed { return false }
+                resumed = true
+                return true
+            }
+        }
+        // Detached tasks: this runs inside the (possibly cancelled)
+        // finalization task, where Task.sleep would throw immediately and a
+        // task group would still block on the unabandonable await.
+        return await withCheckedContinuation { continuation in
+            let once = ResumeOnce()
+            Task.detached {
+                for task in tasks { await task.value }
+                if once.claim() { continuation.resume(returning: true) }
+            }
+            Task.detached {
+                try? await Task.sleep(for: .seconds(timeoutSeconds))
+                if once.claim() { continuation.resume(returning: false) }
+            }
+        }
     }
 
     func stop() {
@@ -860,6 +977,7 @@ final class TranscriptionEngine {
         micTask?.cancel()
         sysTask?.cancel()
         micKeepAliveTask?.cancel()
+        liveEpoch += 1
         micTask = nil
         sysTask = nil
         micKeepAliveTask = nil
@@ -874,7 +992,9 @@ final class TranscriptionEngine {
         liveCloudTranscriptIssue = nil
         liveCloudTranscriptionIsProcessing = false
         preparedCloudStartBackend = nil
+        clearDownloadTracking()
         activeTranscriptionSession = nil
+        diarizationManager = nil
         micDiarizationManager = nil
         selfVoiceMatcher = nil
         isRunning = false
@@ -901,7 +1021,13 @@ final class TranscriptionEngine {
         Log.transcription.info("Switching mic from \(self.currentMicDeviceID, privacy: .public) to \(targetMicID, privacy: .public)")
 
         micCapture.finishStream()
-        await micTask?.value
+        // Bounded: the Apple Speech natural-end teardown drains its backlog
+        // and has been observed to wedge outright; a device switch must not
+        // silently kill the mic channel for the rest of the session.
+        if await Self.awaitTeardown(of: [micTask].compactMap { $0 }, timeoutSeconds: 10) == false {
+            Log.transcription.error("Mic transcriber teardown timed out during device switch; abandoning")
+            micTask?.cancel()
+        }
 
         if Task.isCancelled || !isRunning {
             return
@@ -952,7 +1078,10 @@ final class TranscriptionEngine {
         Log.transcription.info("Restarting system audio stream")
 
         systemCapture.finishStream()
-        await sysTask?.value
+        if await Self.awaitTeardown(of: [sysTask].compactMap { $0 }, timeoutSeconds: 10) == false {
+            Log.transcription.error("System transcriber teardown timed out during restart; abandoning")
+            sysTask?.cancel()
+        }
 
         if Task.isCancelled || !isRunning {
             return
@@ -994,18 +1123,23 @@ final class TranscriptionEngine {
         }
 
         let store = transcriptStore
+        let epoch = liveEpoch
         guard let micTranscriber = makeTranscriber(
             locale: locale,
             speaker: .you,
             vadManager: vadManager,
-            onPartial: { text in
-                Task { @MainActor in store.volatileYouText = text }
+            onPartial: { [weak self] text in
+                Task { @MainActor in
+                    guard let self, self.liveEpoch == epoch else { return }
+                    store.volatileYouText = text
+                }
             },
             onFinal: { [weak self] segment in
                 Task { @MainActor in
+                    guard let self, self.liveEpoch == epoch else { return }
                     store.volatileYouText = ""
                     var speaker: Speaker = .you
-                    if let self, let dm = self.micDiarizationManager {
+                    if let dm = self.micDiarizationManager {
                         let diarized = await dm.dominantSpeaker(
                             from: segment.startTime,
                             to: segment.endTime,
@@ -1125,18 +1259,23 @@ final class TranscriptionEngine {
         }
 
         let store = transcriptStore
+        let epoch = liveEpoch
         guard let sysTranscriber = makeTranscriber(
             locale: locale,
             speaker: .them,
             vadManager: vadManager,
-            onPartial: { text in
-                Task { @MainActor in store.volatileThemText = text }
+            onPartial: { [weak self] text in
+                Task { @MainActor in
+                    guard let self, self.liveEpoch == epoch else { return }
+                    store.volatileThemText = text
+                }
             },
             onFinal: { [weak self] segment in
                 Task { @MainActor in
+                    guard let self, self.liveEpoch == epoch else { return }
                     store.volatileThemText = ""
                     let speaker: Speaker
-                    if let dm = self?.diarizationManager {
+                    if let dm = self.diarizationManager {
                         speaker = await dm.dominantSpeaker(from: segment.startTime, to: segment.endTime)
                     } else {
                         speaker = .them
@@ -1164,6 +1303,14 @@ final class TranscriptionEngine {
 
     /// Passes a capture stream through unchanged while feeding a resampling
     /// diarization feeder; flushes the feeder's tail when the stream ends.
+    ///
+    /// The feeder runs on its own bounded side-channel: awaiting LS-EEND
+    /// inference inline used to backpressure the transcription feed (live ASR
+    /// lag) and, worse, let raw native-rate audio buffer without limit in the
+    /// upstream capture stream whenever inference fell behind realtime. A
+    /// diarizer that falls minutes behind now drops its oldest audio instead
+    /// (with a one-time log), which only degrades live speaker labels — the
+    /// batch pass re-diarizes from the recorded stems.
     private nonisolated static func diarizationTappedStream(
         _ stream: AsyncStream<AVAudioPCMBuffer>,
         feeder: DiarizationStreamFeeder
@@ -1171,14 +1318,31 @@ final class TranscriptionEngine {
         struct Box: @unchecked Sendable { let stream: AsyncStream<AVAudioPCMBuffer> }
         let box = Box(stream: stream)
         let (tapped, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let (feed, feedContinuation) = AsyncStream<AVAudioPCMBuffer>.makeStream(
+            bufferingPolicy: .bufferingNewest(300)
+        )
+        let feedBox = Box(stream: feed)
+        let feedTask = Task.detached {
+            for await buffer in feedBox.stream {
+                await feeder.ingest(buffer)
+            }
+            await feeder.flush()
+        }
         Task.detached {
+            var loggedDrop = false
             for await buffer in box.stream {
                 nonisolated(unsafe) let b = buffer
                 continuation.yield(b)
-                await feeder.ingest(b)
+                if case .dropped = feedContinuation.yield(b), !loggedDrop {
+                    loggedDrop = true
+                    Log.transcription.error("Diarizer fell behind realtime; dropping its oldest audio (live labels may degrade)")
+                }
             }
-            await feeder.flush()
+            // Finish downstream first: the transcriber's natural-end teardown
+            // must not wait behind the diarizer draining its backlog.
             continuation.finish()
+            feedContinuation.finish()
+            await feedTask.value
         }
         return tapped
     }
@@ -1200,7 +1364,13 @@ final class TranscriptionEngine {
                 speakerKey: speaker.storageKey,
                 customVocabulary: settings.transcriptionCustomVocabulary,
                 onPartial: onPartial,
-                onFinal: onFinal
+                onFinal: onFinal,
+                onError: { [weak self] message in
+                    Task { @MainActor in
+                        guard let self, self.isRunning else { return }
+                        self.lastError = message
+                    }
+                }
             )
         }
 

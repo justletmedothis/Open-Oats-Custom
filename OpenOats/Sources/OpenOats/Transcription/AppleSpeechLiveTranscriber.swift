@@ -25,21 +25,25 @@ final class AppleSpeechLiveTranscriber: LiveTranscribing, @unchecked Sendable {
     private let vocabulary: VocabularyRewriter
     private let onPartial: @Sendable (String) -> Void
     private let onFinal: @Sendable (StreamingTranscriber.FinalSegment) -> Void
+    private let onError: (@Sendable (String) -> Void)?
 
     private var converter: AVAudioConverter?
+    private var loggedConverterFailure = false
 
     init(
         locale: Locale,
         speakerKey: String,
         customVocabulary: String,
         onPartial: @escaping @Sendable (String) -> Void,
-        onFinal: @escaping @Sendable (StreamingTranscriber.FinalSegment) -> Void
+        onFinal: @escaping @Sendable (StreamingTranscriber.FinalSegment) -> Void,
+        onError: (@Sendable (String) -> Void)? = nil
     ) {
         self.locale = locale
         self.speakerKey = speakerKey
         self.vocabulary = VocabularyRewriter(customVocabulary)
         self.onPartial = onPartial
         self.onFinal = onFinal
+        self.onError = onError
     }
 
     func run(stream: AsyncStream<AVAudioPCMBuffer>) async {
@@ -49,6 +53,13 @@ final class AppleSpeechLiveTranscriber: LiveTranscribing, @unchecked Sendable {
             // Session stopped.
         } catch {
             Log.transcription.error("[\(self.speakerKey, privacy: .public)] Apple Speech live transcription failed: \(error, privacy: .public)")
+            onError?("Apple Speech live transcription failed: \(error.localizedDescription)")
+            // The capture tees keep pumping this stream for the rest of the
+            // session; leaving it unconsumed would buffer raw audio without
+            // bound. Drain and discard until the session ends.
+            for await _ in stream {
+                if Task.isCancelled { break }
+            }
         }
     }
 
@@ -69,7 +80,12 @@ final class AppleSpeechLiveTranscriber: LiveTranscribing, @unchecked Sendable {
         }
 
         let analyzer = SpeechAnalyzer(modules: [transcriber])
-        let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+        // Bounded: if the analyzer falls behind realtime, drop the oldest
+        // backlog instead of buffering audio without limit (the batch pass is
+        // the accuracy anchor). ~600 capture buffers is roughly a minute.
+        let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream(
+            bufferingPolicy: .bufferingNewest(600)
+        )
 
         let onPartial = self.onPartial
         let onFinal = self.onFinal
@@ -102,6 +118,11 @@ final class AppleSpeechLiveTranscriber: LiveTranscribing, @unchecked Sendable {
             }
         }
 
+        // If start() throws (or anything below does), the results task would
+        // otherwise stay blocked on transcriber.results forever. On the paths
+        // that already awaited or cancelled it this is a no-op.
+        defer { resultsTask.cancel() }
+
         try await analyzer.start(inputSequence: inputSequence)
 
         for await buffer in stream {
@@ -114,18 +135,21 @@ final class AppleSpeechLiveTranscriber: LiveTranscribing, @unchecked Sendable {
         inputBuilder.finish()
         onPartial("")
         if Task.isCancelled {
-            // The session is stopping. finalizeAndFinishThroughEndOfInput drains
-            // every buffered sample through the model before returning, which on
-            // a memory-constrained machine (two live analyzers + Sidecast) can
-            // trail the audio by many seconds and stall the Stop button for that
-            // whole backlog. The batch pass re-transcribes the session and
-            // overwrites the live transcript anyway, so drop the backlog and
-            // finish immediately instead.
-            await analyzer.cancelAndFinishNow()
-        } else {
-            // Natural stream end (device loss, restart): keep the tail.
-            try? await analyzer.finalizeAndFinishThroughEndOfInput()
+            // The session is stopping. Nothing about the analyzer's teardown can
+            // be awaited safely here: finalizeAndFinishThroughEndOfInput drains
+            // the whole buffered backlog through the model, and even
+            // cancelAndFinishNow has been observed to wedge with the results
+            // stream never terminating, which hung Stop until the watchdog and
+            // left the engine unable to record again. The batch pass
+            // re-transcribes the session anyway, so abandon the analyzer:
+            // request the cancel from a detached task and return immediately.
+            resultsTask.cancel()
+            nonisolated(unsafe) let doomedAnalyzer = analyzer
+            Task.detached { await doomedAnalyzer.cancelAndFinishNow() }
+            return
         }
+        // Natural stream end (device loss, restart): keep the tail.
+        try? await analyzer.finalizeAndFinishThroughEndOfInput()
         await resultsTask.value
     }
 
@@ -134,6 +158,10 @@ final class AppleSpeechLiveTranscriber: LiveTranscribing, @unchecked Sendable {
         // Rebuild on format changes (mic restarts, device switches).
         if converter == nil || converter?.inputFormat != buffer.format || converter?.outputFormat != format {
             converter = AVAudioConverter(from: buffer.format, to: format)
+            if converter == nil, !loggedConverterFailure {
+                loggedConverterFailure = true
+                Log.transcription.error("[\(self.speakerKey, privacy: .public)] Apple Speech: no converter from \(buffer.format, privacy: .public) to analyzer format; channel audio is being dropped")
+            }
         }
         guard let converter else { return nil }
         let ratio = format.sampleRate / buffer.format.sampleRate

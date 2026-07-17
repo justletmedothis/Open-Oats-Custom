@@ -197,6 +197,29 @@ final class TranscriptionEngineTests: XCTestCase {
             CloudTranscriptCopy.processingChunk.detail
         )
     }
+
+    // MARK: - Finalize Teardown Timeout
+
+    func testAwaitTeardownReturnsTrueWhenTasksComplete() async {
+        let quick = Task<Void, Never> {}
+        let finished = await TranscriptionEngine.awaitTeardown(of: [quick], timeoutSeconds: 5)
+        XCTAssertTrue(finished)
+    }
+
+    func testAwaitTeardownAbandonsWedgedTask() async {
+        // Simulates a transcriber whose results stream never terminates.
+        let wedged = Task<Void, Never> {
+            try? await Task.sleep(for: .seconds(60))
+        }
+        let finished = await TranscriptionEngine.awaitTeardown(of: [wedged], timeoutSeconds: 0.2)
+        XCTAssertFalse(finished)
+        wedged.cancel()
+    }
+
+    func testAwaitTeardownWithNoTasksReturnsImmediately() async {
+        let finished = await TranscriptionEngine.awaitTeardown(of: [], timeoutSeconds: 0)
+        XCTAssertTrue(finished)
+    }
 }
 
 // MARK: - Test Helpers
