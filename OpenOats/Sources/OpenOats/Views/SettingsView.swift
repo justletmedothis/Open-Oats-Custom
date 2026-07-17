@@ -634,7 +634,10 @@ private struct TranscriptionSettingsTab: View {
                         .font(.system(size: 12))
                     }
 
-                    if settings.enableMicDiarization {
+                }
+
+                if settings.enableMicDiarization {
+                    Section("People") {
                         savedVoicesRows
                     }
                 }
@@ -747,11 +750,8 @@ private struct TranscriptionSettingsTab: View {
     @ViewBuilder
     private var savedVoicesRows: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Saved voices")
-                .font(.system(size: 12, weight: .medium))
-
             // Your own enrolled voice, so the roster is complete. Managed by the
-            // "My voice" controls above (record / re-record / remove).
+            // voice profile controls in Speaker Diarization (record / re-record / remove).
             if let selfProfile = voiceEnrollment.profile {
                 HStack {
                     Text("You")
