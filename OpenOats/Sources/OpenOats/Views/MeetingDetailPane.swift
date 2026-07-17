@@ -3355,7 +3355,9 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
                 if isRenameable {
                     Button(label) {
                         speakerRenameText = label
-                        rememberSpeakerVoice = false
+                        // Naming a voice remembers it by default (matching the
+                        // live naming path); uncheck to name it just this once.
+                        rememberSpeakerVoice = true
                         renamingSpeakerKey = speakerKey
                     }
                     .buttonStyle(.plain)

@@ -857,25 +857,38 @@ actor BatchAudioTranscriber {
         // Retain batch stems/metadata for a bounded rerun/debug window.
         // SessionRepository purges expired retained assets on startup.
 
-        // Persist per-speaker embeddings ("Remember this voice" enrollment)
-        // and auto-name lettered speakers recognized from the library. Runs
-        // after the save so auto-names land on top of the pruned name map.
+        // Persist per-speaker embeddings and update the voice library. A voice
+        // the user named during this session (live speaker naming, reconciled
+        // onto the final letters just above) is enrolled into the library
+        // automatically: naming someone IS the signal to remember them, so the
+        // same voice is auto-named in future meetings without a separate opt-in
+        // step. In-person voices the user did not name fall back to matching
+        // against the library. Runs after the save so names land on top of the
+        // pruned map. (Post-meeting renames happen after this pass and enroll
+        // through NotesController.rememberSpeakerVoice instead.)
         if !speakerKeyEmbeddings.isEmpty {
             await sessionRepository.saveSpeakerEmbeddings(sessionID: sessionID, embeddings: speakerKeyEmbeddings)
+
+            // User intent only: library auto-names have not been merged yet, so
+            // any name here came from the user naming the speaker this session.
+            let userNames = await sessionRepository.loadSession(id: sessionID).index.speakerNames ?? [:]
             let profiles = SpeakerLibraryStore.load()
-            if !profiles.isEmpty {
-                var autoNames: [String: String] = [:]
-                for (key, embedding) in speakerKeyEmbeddings {
-                    guard let profile = SpeakerLibraryStore.match(embedding: embedding, in: profiles) else { continue }
-                    autoNames[key] = profile.name
-                    // Reinforce the centroid so the voiceprint tracks the
-                    // speaker across mics and meetings.
-                    SpeakerLibraryStore.addSample(name: profile.name, embedding: embedding)
-                }
-                if !autoNames.isEmpty {
-                    Log.batchTranscription.info("Auto-named \(autoNames.count, privacy: .public) speaker(s) from the voice library")
-                    await sessionRepository.mergeSessionSpeakerNames(sessionID: sessionID, adding: autoNames)
-                }
+
+            let resolution = Self.resolveLibraryNaming(
+                embeddings: speakerKeyEmbeddings,
+                userNames: userNames,
+                profiles: profiles
+            )
+            for enrollment in resolution.enrollments {
+                // Running-mean centroid improves the profile with every meeting.
+                SpeakerLibraryStore.addSample(name: enrollment.name, embedding: enrollment.embedding)
+            }
+            if !resolution.enrollments.isEmpty {
+                Log.batchTranscription.info("Enrolled/reinforced \(resolution.enrollments.count, privacy: .public) speaker voice(s) in the library")
+            }
+            if !resolution.autoNames.isEmpty {
+                Log.batchTranscription.info("Auto-named \(resolution.autoNames.count, privacy: .public) speaker(s) from the voice library")
+                await sessionRepository.mergeSessionSpeakerNames(sessionID: sessionID, adding: resolution.autoNames)
             }
         }
 
@@ -1103,6 +1116,44 @@ actor BatchAudioTranscriber {
             guard let mapped = mapping[record.speaker] else { return record }
             return record.withSpeaker(mapped)
         }
+    }
+
+    /// One voice-library decision for a diarized in-person speaker.
+    struct LibraryNamingResolution: Equatable {
+        struct Enrollment: Equatable {
+            let name: String
+            let embedding: [Float]
+        }
+        /// Voices to add/reinforce in the library (user-named this session, or
+        /// recognized from a prior meeting — either way the profile improves).
+        var enrollments: [Enrollment]
+        /// Names to write onto the session, keyed by speaker storageKey, for
+        /// speakers recognized from the library the user had not already named.
+        var autoNames: [String: String]
+    }
+
+    /// Decides what happens to each in-person speaker that has an extracted
+    /// voice embedding: a voice the user named this session is enrolled into
+    /// the library so it is auto-named next time; an un-named voice that
+    /// matches a stored profile is auto-named (and reinforced). A user name
+    /// always wins over a library match. Pure so the policy is unit-tested
+    /// without touching disk.
+    static func resolveLibraryNaming(
+        embeddings: [String: [Float]],
+        userNames: [String: String],
+        profiles: [SpeakerProfile]
+    ) -> LibraryNamingResolution {
+        var enrollments: [LibraryNamingResolution.Enrollment] = []
+        var autoNames: [String: String] = [:]
+        for (key, embedding) in embeddings.sorted(by: { $0.key < $1.key }) {
+            if let userName = userNames[key]?.trimmingCharacters(in: .whitespaces), !userName.isEmpty {
+                enrollments.append(.init(name: userName, embedding: embedding))
+            } else if let profile = SpeakerLibraryStore.match(embedding: embedding, in: profiles) {
+                autoNames[key] = profile.name
+                enrollments.append(.init(name: profile.name, embedding: embedding))
+            }
+        }
+        return LibraryNamingResolution(enrollments: enrollments, autoNames: autoNames)
     }
 
     /// Maps live-assigned lettered-speaker names onto the re-diarized speakers

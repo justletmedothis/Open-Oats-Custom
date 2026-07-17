@@ -34,6 +34,69 @@ final class SpeakerLibraryTests: XCTestCase {
     func testMatchEmptyLibrary() {
         XCTAssertNil(SpeakerLibraryStore.match(embedding: [1, 0, 0], in: []))
     }
+
+    // MARK: - Batch naming policy (resolveLibraryNaming)
+
+    // A voice the user named this session is enrolled into the library, even
+    // when the library is empty — this is the fix for names not surviving into
+    // the next meeting. (Naming a speaker used to persist only the session
+    // label, never the voiceprint.)
+    func testUserNamedVoiceIsEnrolledEvenWithEmptyLibrary() {
+        let resolution = BatchAudioTranscriber.resolveLibraryNaming(
+            embeddings: ["local_1": [1, 0, 0]],
+            userNames: ["local_1": "Matt"],
+            profiles: []
+        )
+        XCTAssertEqual(resolution.enrollments, [.init(name: "Matt", embedding: [1, 0, 0])])
+        XCTAssertTrue(resolution.autoNames.isEmpty, "user-named speakers are enrolled, not auto-named")
+    }
+
+    // An un-named voice recognized from the library is auto-named and reinforced.
+    func testRecognizedVoiceIsAutoNamedAndReinforced() {
+        let profiles = [profile(name: "Dana", centroid: [1, 0, 0])]
+        let resolution = BatchAudioTranscriber.resolveLibraryNaming(
+            embeddings: ["local_1": [1, 0, 0]],
+            userNames: [:],
+            profiles: profiles
+        )
+        XCTAssertEqual(resolution.autoNames, ["local_1": "Dana"])
+        XCTAssertEqual(resolution.enrollments, [.init(name: "Dana", embedding: [1, 0, 0])])
+    }
+
+    // A user name always wins over a library match for the same voice.
+    func testUserNameOverridesLibraryMatch() {
+        let profiles = [profile(name: "Dana", centroid: [1, 0, 0])]
+        let resolution = BatchAudioTranscriber.resolveLibraryNaming(
+            embeddings: ["local_1": [1, 0, 0]],
+            userNames: ["local_1": "Matt"],
+            profiles: profiles
+        )
+        XCTAssertEqual(resolution.enrollments, [.init(name: "Matt", embedding: [1, 0, 0])])
+        XCTAssertTrue(resolution.autoNames.isEmpty)
+    }
+
+    // An unrecognized, un-named voice is left alone (no enrollment, no name).
+    func testUnknownUnnamedVoiceIsUntouched() {
+        let profiles = [profile(name: "Dana", centroid: [1, 0, 0])]
+        let resolution = BatchAudioTranscriber.resolveLibraryNaming(
+            embeddings: ["local_1": [0, 0, 1]],
+            userNames: [:],
+            profiles: profiles
+        )
+        XCTAssertTrue(resolution.enrollments.isEmpty)
+        XCTAssertTrue(resolution.autoNames.isEmpty)
+    }
+
+    // Blank/whitespace names are ignored rather than enrolled.
+    func testBlankUserNameIsNotEnrolled() {
+        let resolution = BatchAudioTranscriber.resolveLibraryNaming(
+            embeddings: ["local_1": [1, 0, 0]],
+            userNames: ["local_1": "   "],
+            profiles: []
+        )
+        XCTAssertTrue(resolution.enrollments.isEmpty)
+        XCTAssertTrue(resolution.autoNames.isEmpty)
+    }
 }
 
 final class VoiceprintReinforcementTests: XCTestCase {
