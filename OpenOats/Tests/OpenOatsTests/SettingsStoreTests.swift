@@ -826,13 +826,13 @@ final class SettingsStoreTests: XCTestCase {
         let store1 = makeStore(defaults: defaults)
         store1.llmProvider = .mlx
         store1.silenceTimeoutSeconds = 42
-        store1.transcriptionModel = .qwen3ASR06B
+        store1.transcriptionModel = .whisperSmall
 
         // Create a second store from the same defaults
         let store2 = makeStore(defaults: defaults)
         XCTAssertEqual(store2.llmProvider, .mlx)
         XCTAssertEqual(store2.silenceTimeoutSeconds, 42)
-        XCTAssertEqual(store2.transcriptionModel, .qwen3ASR06B)
+        XCTAssertEqual(store2.transcriptionModel, .whisperSmall)
     }
 
     // MARK: - AppSettings Typealias Compatibility

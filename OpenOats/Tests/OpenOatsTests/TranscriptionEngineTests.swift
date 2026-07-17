@@ -51,7 +51,7 @@ final class TranscriptionEngineTests: XCTestCase {
             transcriptionModel: .whisperBase
         )
 
-        settings.transcriptionModel = .qwen3ASR06B
+        settings.transcriptionModel = .parakeetV3
 
         XCTAssertEqual(engine.currentTranscriptionModel(), .whisperBase)
     }

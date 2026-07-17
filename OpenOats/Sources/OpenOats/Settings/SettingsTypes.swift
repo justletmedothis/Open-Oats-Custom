@@ -339,7 +339,6 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
     case appleSpeech
     case parakeetV2
     case parakeetV3
-    case qwen3ASR06B
     case whisperBase
     case whisperSmall
     case whisperLargeV3Turbo
@@ -373,7 +372,6 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
         case .appleSpeech: "Apple Speech"
         case .parakeetV2: "Parakeet TDT v2"
         case .parakeetV3: "Parakeet TDT v3"
-        case .qwen3ASR06B: "Qwen3 ASR 0.6B"
         case .whisperBase: "Whisper Base"
         case .whisperSmall: "Whisper Small"
         case .whisperLargeV3Turbo: "Whisper Large v3 Turbo"
@@ -389,8 +387,6 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
             "Apple Speech uses the system speech model — macOS downloads it once per language, outside the app."
         case .parakeetV2, .parakeetV3:
             "Transcription requires a one-time model download."
-        case .qwen3ASR06B:
-            "Qwen3 ASR requires a one-time model download."
         case .whisperBase:
             "Whisper Base requires a one-time model download (~142 MB)."
         case .whisperSmall:
@@ -411,7 +407,7 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
         case .whisperBase: 142_000_000
         case .whisperSmall: 244_000_000
         case .whisperLargeV3Turbo: 800_000_000
-        case .appleSpeech, .parakeetV2, .parakeetV3, .qwen3ASR06B: nil
+        case .appleSpeech, .parakeetV2, .parakeetV3: nil
         case .assemblyAI, .elevenLabsScribe, .cohereTranscribeArabic: nil
         }
     }
@@ -422,8 +418,6 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
 
     var localeFieldTitle: String {
         switch self {
-        case .qwen3ASR06B:
-            "Language Hint"
         case .appleSpeech, .parakeetV2, .parakeetV3, .whisperBase, .whisperSmall, .whisperLargeV3Turbo:
             "Locale"
         case .assemblyAI, .elevenLabsScribe, .cohereTranscribeArabic:
@@ -439,8 +433,6 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
             "Parakeet TDT v2 is English-only. Use en-US. This language value is still saved with the session and markdown export."
         case .parakeetV3:
             "Parakeet TDT v3 auto-detects speech language. Use this field to set your expected meeting language for metadata and export."
-        case .qwen3ASR06B:
-            "Used as a language hint for Qwen3 ASR and saved with the session. Enter a locale such as en-US, fr-FR, or ja-JP."
         case .whisperBase, .whisperSmall:
             "Whisper auto-detects speech language. This setting is still saved with the session and markdown export."
         case .whisperLargeV3Turbo:
@@ -469,7 +461,6 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
         case .appleSpeech: return AppleSpeechBackend(localeIdentifier: localeIdentifier, customVocabulary: customVocabulary)
         case .parakeetV2: return ParakeetBackend(version: .v2, customVocabulary: customVocabulary)
         case .parakeetV3: return ParakeetBackend(version: .v3, customVocabulary: customVocabulary)
-        case .qwen3ASR06B: return Qwen3Backend()
         case .whisperBase: return WhisperKitBackend(variant: .base)
         case .whisperSmall: return WhisperKitBackend(variant: .small)
         case .whisperLargeV3Turbo: return WhisperKitBackend(variant: .largeV3Turbo)
@@ -480,7 +471,7 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
     }
 
     /// Flush interval in 16kHz samples for streaming transcription.
-    /// Whisper models benefit from longer context windows (10s); Parakeet/Qwen are robust at 5s.
+    /// Whisper models benefit from longer context windows (10s); Parakeet is robust at 5s.
     var flushIntervalSamples: Int {
         switch self {
         case .whisperBase, .whisperSmall, .whisperLargeV3Turbo:
@@ -489,7 +480,7 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
             // Only used if Apple Speech ever runs through the VAD/segment path
             // (e.g. batch); the live path streams natively without flushing.
             10 * 16_000
-        case .parakeetV2, .parakeetV3, .qwen3ASR06B:
+        case .parakeetV2, .parakeetV3:
             5 * 16_000
         case .assemblyAI, .elevenLabsScribe, .cohereTranscribeArabic:
             10 * 16_000  // 10s - fewer API calls, better accuracy per segment
@@ -498,7 +489,7 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
 
     /// Models suitable for offline batch re-transcription.
     static var batchSuitableModels: [TranscriptionModel] {
-        [.parakeetV2, .parakeetV3, .whisperSmall, .whisperLargeV3Turbo, .qwen3ASR06B]
+        [.parakeetV2, .parakeetV3, .whisperSmall, .whisperLargeV3Turbo]
     }
 }
 

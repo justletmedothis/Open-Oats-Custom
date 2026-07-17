@@ -1,9 +1,23 @@
 import FluidAudio
 import Foundation
 
-/// Manages LS-EEND speaker diarization for a single audio channel.
-/// Wraps the FluidAudio LSEENDDiarizer and provides speaker attribution
-/// for transcribed segments by querying the diarizer timeline.
+extension DiarizationVariant {
+    /// FluidAudio's LS-EEND variant enum lost its String raw values in 0.15.x,
+    /// so the settings value maps by explicit case instead of rawValue.
+    var lseendVariant: LSEENDVariant {
+        switch self {
+        case .ami: .ami
+        case .callhome: .callhome
+        case .dihard3: .dihard3
+        }
+    }
+}
+
+/// Manages speaker diarization for a single audio channel.
+/// Live sessions stream through the FluidAudio LSEENDDiarizer; the batch pass
+/// can instead run the offline VBx pipeline (processOffline), which reclusters
+/// the whole file at once and is substantially more accurate than streaming.
+/// Either way, speaker attribution queries read the same normalized state.
 actor DiarizationManager {
     /// Which capture channel the audio being diarized came from. Controls how
     /// diarizer speaker indices map onto Speaker labels and what the
@@ -39,22 +53,101 @@ actor DiarizationManager {
     /// speaker turns under 0.3 s, bridge same-speaker gaps under 0.6 s, and pad
     /// onsets 0.1 s so word starts aren't clipped. Mirrors the NeMo meeting
     /// recipe (min_duration_off 0.6) and the production 250-400 ms turn floor.
-    private nonisolated(unsafe) let diarizer = LSEENDDiarizer(
-        onsetPadFrames: 1,
-        minFramesOn: 3,
-        minFramesOff: 6
-    )
+    private nonisolated(unsafe) let diarizer: LSEENDDiarizer = {
+        var config = DiarizerTimelineConfig.default(numSpeakers: 1, frameDurationSeconds: 0.1)
+        config.onsetPadFrames = 1
+        config.minFramesOn = 3
+        config.minFramesOff = 6
+        return LSEENDDiarizer(timelineConfig: config)
+    }()
     private var isInitialized = false
+    /// Non-nil after processOffline succeeds: per-speaker segments from the
+    /// offline VBx pass. When set, all attribution queries read this instead
+    /// of the streaming LS-EEND timeline.
+    private var offlineSegments: [Int: [SpeakerSegment]]?
     /// Diarizer index most recently returned by dominantSpeaker, for
     /// sticky-speaker hysteresis on borderline overlap calls.
     private var lastDominantIndex: Int?
 
+    /// Lazily created offline VBx pipeline, kept loaded so mic and system
+    /// channels processed back to back reuse the same CoreML models.
+    private nonisolated(unsafe) var offlineManager: OfflineDiarizerManager?
+
+    /// Whether the streaming LS-EEND model has been loaded via load(variant:).
+    var isStreamingModelLoaded: Bool { isInitialized }
+
     /// Load the LS-EEND model for the given variant. Must be called before feedAudio/dominantSpeaker.
     func load(variant: LSEENDVariant = .dihard3) async throws {
-        Log.diarization.info("Loading LS-EEND model (variant: \(variant.rawValue, privacy: .public))")
+        Log.diarization.info("Loading LS-EEND model (variant: \(String(describing: variant), privacy: .public))")
         try await diarizer.initialize(variant: variant)
         isInitialized = true
         Log.diarization.info("LS-EEND model loaded")
+    }
+
+    /// Run the offline VBx diarization pipeline over a complete recording and
+    /// serve all subsequent attribution queries from its result (until reset).
+    /// Offline reclustering of the whole file is substantially more accurate
+    /// than the streaming timeline (~11% vs ~30% DER on meeting benchmarks).
+    /// Downloads the offline models on first use.
+    func processOffline(_ samples: [Float]) async throws {
+        if offlineManager == nil {
+            offlineManager = OfflineDiarizerManager()
+            do {
+                try await offlineManager?.prepareModels()
+            } catch {
+                // Leave no half-initialized manager behind for the next attempt.
+                offlineManager = nil
+                throw error
+            }
+        }
+        let processed: DiarizationResult?
+        do {
+            processed = try await offlineManager?.process(audio: samples)
+        } catch OfflineDiarizationError.noSpeechDetected {
+            // A silent channel (e.g. no call audio during an in-person
+            // meeting) is a valid empty result, not an engine failure: record
+            // it so the caller doesn't fall back to streaming LS-EEND just to
+            // rediscover the silence.
+            offlineSegments = [:]
+            Log.diarization.info("Offline VBx diarization: no speech detected on this channel")
+            return
+        }
+        guard let result = processed else { return }
+
+        // Map speaker ids to integer indices in order of first appearance so
+        // downstream lettering (Speaker A, B, ...) follows speaking order.
+        var indexBySpeakerId: [String: Int] = [:]
+        var segments: [Int: [SpeakerSegment]] = [:]
+        for segment in result.segments.sorted(by: { $0.startTimeSeconds < $1.startTimeSeconds }) {
+            let index: Int
+            if let existing = indexBySpeakerId[segment.speakerId] {
+                index = existing
+            } else {
+                index = indexBySpeakerId.count
+                indexBySpeakerId[segment.speakerId] = index
+            }
+            segments[index, default: []].append(
+                SpeakerSegment(start: segment.startTimeSeconds, end: segment.endTimeSeconds)
+            )
+        }
+        offlineSegments = segments
+        Log.diarization.info("Offline VBx diarization complete: \(segments.count, privacy: .public) speaker(s) across \(result.segments.count, privacy: .public) segments")
+    }
+
+    /// Speaker segments from whichever engine ran, keyed by diarizer index.
+    /// Offline results win when present; otherwise the live LS-EEND timeline
+    /// (finalized plus tentative segments) is normalized into the same shape.
+    private func segmentsByIndex() -> [Int: [SpeakerSegment]] {
+        if let offlineSegments { return offlineSegments }
+        var result: [Int: [SpeakerSegment]] = [:]
+        for (index, speaker) in diarizer.timeline.speakers {
+            let segments = (speaker.finalizedSegments + speaker.tentativeSegments)
+                .map { SpeakerSegment(start: $0.startTime, end: $0.endTime) }
+            if !segments.isEmpty {
+                result[index] = segments
+            }
+        }
+        return result
     }
 
     /// Feed audio samples to the diarizer. Samples should be at 16kHz mono Float32.
@@ -73,8 +166,7 @@ actor DiarizationManager {
         to endTime: TimeInterval,
         channel: Channel = .system
     ) -> Speaker {
-        let timeline = diarizer.timeline
-        let speakers = timeline.speakers
+        let speakers = segmentsByIndex()
 
         guard !speakers.isEmpty else { return channel.fallbackSpeaker }
 
@@ -85,13 +177,12 @@ actor DiarizationManager {
         let queryStart = Float(startTime)
         let queryEnd = Float(endTime)
 
-        for (index, speaker) in speakers {
-            let allSegments = speaker.finalizedSegments + speaker.tentativeSegments
+        for (index, segments) in speakers {
             var overlap: Float = 0
 
-            for segment in allSegments {
-                let overlapStart = max(segment.startTime, queryStart)
-                let overlapEnd = min(segment.endTime, queryEnd)
+            for segment in segments {
+                let overlapStart = max(segment.start, queryStart)
+                let overlapEnd = min(segment.end, queryEnd)
                 if overlapEnd > overlapStart {
                     overlap += overlapEnd - overlapStart
                 }
@@ -121,8 +212,7 @@ actor DiarizationManager {
         // If only one speaker was detected in the entire session, fall back to the
         // channel's single-speaker label (no point labeling "Speaker 1"/"Speaker A"
         // when there's only one voice; on the mic that voice is presumably you).
-        let activeSpeakers = speakers.values.filter { $0.hasSegments }
-        if activeSpeakers.count <= 1 {
+        if speakers.count <= 1 {
             return channel.fallbackSpeaker
         }
 
@@ -138,11 +228,11 @@ actor DiarizationManager {
         let queryStart = Float(startTime)
         let queryEnd = Float(endTime)
         var best: (index: Int, overlap: Float)?
-        for (index, speaker) in diarizer.timeline.speakers {
+        for (index, segments) in segmentsByIndex() {
             var overlap: Float = 0
-            for segment in speaker.finalizedSegments + speaker.tentativeSegments {
-                let overlapStart = max(segment.startTime, queryStart)
-                let overlapEnd = min(segment.endTime, queryEnd)
+            for segment in segments {
+                let overlapStart = max(segment.start, queryStart)
+                let overlapEnd = min(segment.end, queryEnd)
                 if overlapEnd > overlapStart {
                     overlap += overlapEnd - overlapStart
                 }
@@ -162,16 +252,14 @@ actor DiarizationManager {
         to endTime: TimeInterval,
         channel: Channel = .system
     ) -> [BatchTranscriptionSegmentLayout.SpeakerRun] {
-        let timeline = diarizer.timeline
-        let speakers = timeline.speakers
+        let speakers = segmentsByIndex()
 
         guard !speakers.isEmpty else { return [] }
 
         let queryStart = Float(startTime)
         let queryEnd = Float(endTime)
-        let activeSpeakers = speakers.values.filter { $0.hasSegments }
 
-        if activeSpeakers.count <= 1 {
+        if speakers.count <= 1 {
             return [
                 BatchTranscriptionSegmentLayout.SpeakerRun(
                     startTime: startTime,
@@ -183,12 +271,11 @@ actor DiarizationManager {
 
         var runs: [BatchTranscriptionSegmentLayout.SpeakerRun] = []
 
-        for (index, speaker) in speakers {
+        for (index, segments) in speakers {
             let mappedSpeaker = channel.speaker(forDiarizerIndex: index)
-            let allSegments = speaker.finalizedSegments + speaker.tentativeSegments
-            for segment in allSegments {
-                let overlapStart = max(segment.startTime, queryStart)
-                let overlapEnd = min(segment.endTime, queryEnd)
+            for segment in segments {
+                let overlapStart = max(segment.start, queryStart)
+                let overlapEnd = min(segment.end, queryEnd)
                 guard overlapEnd > overlapStart else { continue }
                 runs.append(
                     BatchTranscriptionSegmentLayout.SpeakerRun(
@@ -204,18 +291,11 @@ actor DiarizationManager {
     }
 
     /// All diarized segments grouped by diarizer speaker index. Only speakers
-    /// with at least one segment are included. Call after finalize() and before
-    /// reset(); used to gather per-speaker audio for voiceprint matching.
+    /// with at least one segment are included. Call after finalize() (or
+    /// processOffline) and before reset(); used to gather per-speaker audio
+    /// for voiceprint matching.
     func speakerSegments() -> [Int: [SpeakerSegment]] {
-        var result: [Int: [SpeakerSegment]] = [:]
-        for (index, speaker) in diarizer.timeline.speakers {
-            let segments = (speaker.finalizedSegments + speaker.tentativeSegments)
-                .map { SpeakerSegment(start: $0.startTime, end: $0.endTime) }
-            if !segments.isEmpty {
-                result[index] = segments
-            }
-        }
-        return result
+        segmentsByIndex()
     }
 
     /// Finalize the diarization session (flush tentative segments).
@@ -230,8 +310,9 @@ actor DiarizationManager {
 
     /// Reset the diarizer state for a new session.
     func reset() {
-        guard isInitialized else { return }
         lastDominantIndex = nil
+        offlineSegments = nil
+        guard isInitialized else { return }
         diarizer.reset()
     }
 }

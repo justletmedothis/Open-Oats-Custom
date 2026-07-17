@@ -38,36 +38,6 @@ final class TranscriptionBackendTests: XCTestCase {
         }
     }
 
-    // MARK: - Qwen3Backend
-
-    func testQwen3DisplayName() {
-        let backend = Qwen3Backend()
-        XCTAssertEqual(backend.displayName, "Qwen3 ASR 0.6B")
-    }
-
-    func testQwen3CheckStatusReturnsNeedsDownloadOrReady() {
-        let backend = Qwen3Backend()
-        let status = backend.checkStatus()
-        switch status {
-        case .ready, .needsDownload:
-            break
-        default:
-            XCTFail("Expected .ready or .needsDownload, got \(status)")
-        }
-    }
-
-    func testQwen3TranscribeWithoutPrepareThrows() async {
-        let backend = Qwen3Backend()
-        do {
-            _ = try await backend.transcribe([0.0, 0.1, 0.2], locale: Locale(identifier: "en-US"))
-            XCTFail("Expected error")
-        } catch is TranscriptionBackendError {
-            // Expected
-        } catch {
-            XCTFail("Unexpected error type: \(error)")
-        }
-    }
-
     // MARK: - TranscriptionModel factory
 
     func testMakeBackendParakeetV2() {
@@ -78,11 +48,6 @@ final class TranscriptionBackendTests: XCTestCase {
     func testMakeBackendParakeetV3() {
         let backend = TranscriptionModel.parakeetV3.makeBackend()
         XCTAssertEqual(backend.displayName, "Parakeet TDT v3")
-    }
-
-    func testMakeBackendQwen3() {
-        let backend = TranscriptionModel.qwen3ASR06B.makeBackend()
-        XCTAssertEqual(backend.displayName, "Qwen3 ASR 0.6B")
     }
 
     func testMakeBackendWhisperBase() {
@@ -326,7 +291,6 @@ final class TranscriptionBackendTests: XCTestCase {
         // Local models
         XCTAssertFalse(TranscriptionModel.parakeetV2.isCloud)
         XCTAssertFalse(TranscriptionModel.parakeetV3.isCloud)
-        XCTAssertFalse(TranscriptionModel.qwen3ASR06B.isCloud)
         XCTAssertFalse(TranscriptionModel.whisperBase.isCloud)
         XCTAssertFalse(TranscriptionModel.whisperSmall.isCloud)
         XCTAssertFalse(TranscriptionModel.whisperLargeV3Turbo.isCloud)

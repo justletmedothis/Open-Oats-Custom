@@ -22,7 +22,7 @@ let package = Package(
     dependencies: [
         // FluidAudio has made source-breaking API changes in patch releases.
         // Pin exactly so SwiftPM and Xcode smoke builds resolve the same SDK.
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.13.5"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.15.5"),
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.7.0"),
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "0.9.0"),
         .package(url: "https://github.com/sindresorhus/LaunchAtLogin-Modern", from: "1.1.0"),

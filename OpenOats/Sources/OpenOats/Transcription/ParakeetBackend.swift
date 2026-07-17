@@ -47,7 +47,11 @@ final class ParakeetBackend: TranscriptionBackend, @unchecked Sendable {
         guard let asrManager else {
             throw TranscriptionBackendError.notPrepared
         }
-        let result = try await asrManager.transcribe(samples)
+        // Each call transcribes an independent VAD-bounded segment, so the
+        // decoder starts fresh rather than carrying state across segments
+        // (the pre-0.15 API did the same internally per audio source).
+        var decoderState = try TdtDecoderState()
+        let result = try await asrManager.transcribe(samples, decoderState: &decoderState)
         return result.text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -209,7 +209,6 @@ final class TranscriptionEngine {
     /// Separate backend instances for mic and system audio.
     /// Parakeet keeps mutable decoder state per manager, so mic and system audio
     /// need separate instances even when they share the same loaded model files.
-    /// For Qwen3 (actor-based, thread-safe), both point to the same backend instance.
     private var micBackend: (any TranscriptionBackend)?
     private var systemBackend: (any TranscriptionBackend)?
     private var vadManager: VadManager?
@@ -473,10 +472,9 @@ final class TranscriptionEngine {
             self.micBackend = mic
 
             // Parakeet needs a separate backend for system audio (mutable decoder state).
-            // Qwen3 is actor-based and thread-safe, so reuse the same instance.
             // Apple Speech is stateless per call (the live path builds its own
             // analyzers), so one shared backend is fine.
-            if transcriptionModel == .qwen3ASR06B || transcriptionModel == .appleSpeech || transcriptionModel.isCloud {
+            if transcriptionModel == .appleSpeech || transcriptionModel.isCloud {
                 self.systemBackend = mic
             } else {
                 let sys = transcriptionModel.makeBackend(customVocabulary: vocab, apiKey: apiKey, removeFillerWords: noFiller)
@@ -494,7 +492,7 @@ final class TranscriptionEngine {
                 assetStatus = "Loading diarization model..."
                 Log.transcription.info("Loading LS-EEND diarization model")
                 let dm = DiarizationManager()
-                let variant = LSEENDVariant(rawValue: settings.diarizationVariant.rawValue) ?? .dihard3
+                let variant = settings.diarizationVariant.lseendVariant
                 try await dm.load(variant: variant)
                 self.diarizationManager = dm
                 Log.transcription.info("Diarization model loaded")
@@ -509,7 +507,7 @@ final class TranscriptionEngine {
                 assetStatus = "Loading in-person diarization model..."
                 Log.transcription.info("Loading LS-EEND mic diarization model")
                 let dm = DiarizationManager()
-                let variant = LSEENDVariant(rawValue: settings.diarizationVariant.rawValue) ?? .dihard3
+                let variant = settings.diarizationVariant.lseendVariant
                 try await dm.load(variant: variant)
                 self.micDiarizationManager = dm
                 if let voiceprint = VoiceprintStore.load()?.embedding {
@@ -1384,7 +1382,7 @@ final class TranscriptionEngine {
         }
 
         let localeIdentifier = locale.identifier.replacingOccurrences(of: "_", with: "-")
-        return "Parakeet TDT v2 is English-only. Switch to Parakeet TDT v3 or Qwen3 ASR for \(localeIdentifier)."
+        return "Parakeet TDT v2 is English-only. Switch to Parakeet TDT v3 for \(localeIdentifier)."
     }
 
     private func normalizedLanguageCode(for locale: Locale) -> String? {

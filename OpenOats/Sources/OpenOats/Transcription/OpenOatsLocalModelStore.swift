@@ -20,23 +20,6 @@ enum OpenOatsLocalModelStore {
         return wrapper
     }
 
-    static func qwen3Directory(
-        variant: Qwen3AsrVariant = .f32,
-        baseDirectory: URL = defaultBaseDirectory(),
-        fluidAudioModelsRoot: URL = MLModelConfigurationUtils.defaultModelsDirectory()
-    ) -> URL {
-        let target = baseDirectory
-            .appendingPathComponent("qwen3-asr", isDirectory: true)
-            .appendingPathComponent(variant.rawValue, isDirectory: true)
-
-        _ = migrateQwen3IfNeeded(
-            variant: variant,
-            targetDirectory: target,
-            fluidAudioModelsRoot: fluidAudioModelsRoot
-        )
-        return target
-    }
-
     static func clearParakeetCache(
         for version: AsrModelVersion,
         baseDirectory: URL = defaultBaseDirectory(),
@@ -50,40 +33,6 @@ enum OpenOatsLocalModelStore {
         parakeetMigrationCandidates(for: version, fluidAudioModelsRoot: fluidAudioModelsRoot).forEach {
             try? fileManager.removeItem(at: $0)
         }
-    }
-
-    static func clearQwen3Cache(
-        variant: Qwen3AsrVariant = .f32,
-        baseDirectory: URL = defaultBaseDirectory(),
-        fluidAudioModelsRoot: URL = MLModelConfigurationUtils.defaultModelsDirectory()
-    ) {
-        let fileManager = FileManager.default
-        let target = baseDirectory
-            .appendingPathComponent("qwen3-asr", isDirectory: true)
-            .appendingPathComponent(variant.rawValue, isDirectory: true)
-        try? fileManager.removeItem(at: target)
-        qwen3MigrationCandidates(for: variant, fluidAudioModelsRoot: fluidAudioModelsRoot).forEach {
-            try? fileManager.removeItem(at: $0)
-        }
-    }
-
-    static func migrateDownloadedQwen3Models(
-        from sourceDirectory: URL,
-        variant: Qwen3AsrVariant = .f32,
-        baseDirectory: URL = defaultBaseDirectory(),
-        fluidAudioModelsRoot: URL = MLModelConfigurationUtils.defaultModelsDirectory()
-    ) -> URL {
-        let target = baseDirectory
-            .appendingPathComponent("qwen3-asr", isDirectory: true)
-            .appendingPathComponent(variant.rawValue, isDirectory: true)
-
-        moveDirectoryIfNeeded(from: sourceDirectory, to: target)
-        _ = migrateQwen3IfNeeded(
-            variant: variant,
-            targetDirectory: target,
-            fluidAudioModelsRoot: fluidAudioModelsRoot
-        )
-        return target
     }
 
     static func defaultBaseDirectory(appSupportDirectory: URL? = nil) -> URL {
@@ -119,26 +68,6 @@ enum OpenOatsLocalModelStore {
         return wrapperDirectory
     }
 
-    private static func migrateQwen3IfNeeded(
-        variant: Qwen3AsrVariant,
-        targetDirectory: URL,
-        fluidAudioModelsRoot: URL
-    ) -> URL {
-        let fileManager = FileManager.default
-        if fileManager.fileExists(atPath: targetDirectory.path) {
-            return targetDirectory
-        }
-
-        for candidate in qwen3MigrationCandidates(for: variant, fluidAudioModelsRoot: fluidAudioModelsRoot) {
-            if fileManager.fileExists(atPath: candidate.path) {
-                moveDirectoryIfNeeded(from: candidate, to: targetDirectory)
-                break
-            }
-        }
-
-        return targetDirectory
-    }
-
     private static func parakeetMigrationCandidates(
         for version: AsrModelVersion,
         fluidAudioModelsRoot: URL
@@ -146,17 +75,6 @@ enum OpenOatsLocalModelStore {
         candidateDirectories(
             currentRelativePath: parakeetCurrentRelativePath(for: version),
             legacyRelativePath: parakeetLegacyRelativePath(for: version),
-            root: fluidAudioModelsRoot
-        )
-    }
-
-    private static func qwen3MigrationCandidates(
-        for variant: Qwen3AsrVariant,
-        fluidAudioModelsRoot: URL
-    ) -> [URL] {
-        candidateDirectories(
-            currentRelativePath: variant.repo.folderName,
-            legacyRelativePath: variant.repo.name,
             root: fluidAudioModelsRoot
         )
     }
@@ -209,11 +127,11 @@ enum OpenOatsLocalModelStore {
         case .v2:
             return Repo.parakeetV2.folderName
         case .v3:
-            return Repo.parakeet.folderName
+            return Repo.parakeetV3.folderName
         case .tdtCtc110m:
             return Repo.parakeetTdtCtc110m.folderName
-        case .ctcZhCn:
-            return Repo.parakeetCtcZhCn.folderName
+        case .tdtJa:
+            return Repo.parakeetJa.folderName
         }
     }
 
@@ -222,11 +140,11 @@ enum OpenOatsLocalModelStore {
         case .v2:
             return Repo.parakeetV2.name
         case .v3:
-            return Repo.parakeet.name
+            return Repo.parakeetV3.name
         case .tdtCtc110m:
             return Repo.parakeetTdtCtc110m.name
-        case .ctcZhCn:
-            return Repo.parakeetCtcZhCn.name
+        case .tdtJa:
+            return Repo.parakeetJa.name
         }
     }
 
@@ -246,8 +164,8 @@ enum OpenOatsLocalModelStore {
             return "parakeet-v3"
         case .tdtCtc110m:
             return "parakeet-tdt-ctc-110m"
-        case .ctcZhCn:
-            return "parakeet-ctc-zh-cn"
+        case .tdtJa:
+            return "parakeet-ja"
         }
     }
 }

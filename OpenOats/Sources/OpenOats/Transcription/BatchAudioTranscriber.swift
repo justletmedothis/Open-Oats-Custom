@@ -547,32 +547,55 @@ actor BatchAudioTranscriber {
         let totalFiles = (urls.mic != nil ? 1 : 0) + (urls.sys != nil ? 1 : 0)
         var filesProcessed = 0
 
-        // One shared LS-EEND diarizer serves both channels sequentially
-        // (reset between files) so only a single model stays in memory.
+        // One shared diarizer serves both channels sequentially (reset between
+        // files) so only a single set of models stays in memory.
         let useElevenLabsNativeDiarization = enableDiarization && model == .elevenLabsScribe
         // Scribe's native diarization numbers speakers per API call, and the
         // mic channel is transcribed one VAD segment per call: letters would
         // not be stable across segments, and segments with a single talker
         // would collapse to "you" regardless of who spoke. The mic channel
-        // therefore always uses LS-EEND (whole-file context, and required for
-        // voiceprint self-identification); Scribe native diarization remains
-        // in use for system audio only.
-        let needsLSEENDForMic = enableMicDiarization && urls.mic != nil
-        let needsLSEENDForSys = enableDiarization && !useElevenLabsNativeDiarization && urls.sys != nil
+        // therefore always uses local diarization (whole-file context, and
+        // required for voiceprint self-identification); Scribe native
+        // diarization remains in use for system audio only.
+        let needsDiarizationForMic = enableMicDiarization && urls.mic != nil
+        let needsDiarizationForSys = enableDiarization && !useElevenLabsNativeDiarization && urls.sys != nil
         var batchDiarizer: DiarizationManager?
-        if needsLSEENDForMic || needsLSEENDForSys {
+        if needsDiarizationForMic || needsDiarizationForSys {
+            batchDiarizer = DiarizationManager()
+        }
+
+        // The batch pass prefers the offline VBx pipeline (whole-file
+        // reclustering, roughly 3x lower diarization error than the streaming
+        // model on meeting benchmarks) and falls back to streaming LS-EEND if
+        // the offline models cannot be loaded (e.g. first run while offline).
+        // Diarization is an enhancement either way: a channel where both
+        // engines fail is transcribed without speaker letters rather than
+        // sinking the whole re-transcription.
+        func diarizeWholeFile(
+            _ samples: [Float],
+            with dm: DiarizationManager,
+            channelName: StaticString
+        ) async throws -> Bool {
             do {
-                let dm = DiarizationManager()
-                let variant = LSEENDVariant(rawValue: diarizationVariant.rawValue) ?? .dihard3
-                try await dm.load(variant: variant)
-                batchDiarizer = dm
+                try await dm.processOffline(samples)
+                return true
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                // Diarization is an enhancement: a missing or undownloadable
-                // model (e.g. first run while offline) must not sink the
-                // whole re-transcription.
-                Log.batchTranscription.warning("Speaker diarization unavailable, continuing without it: \(error, privacy: .public)")
+                Log.batchTranscription.warning("Offline diarization failed for \(channelName, privacy: .public) audio, falling back to LS-EEND: \(error, privacy: .public)")
+            }
+            do {
+                if await !dm.isStreamingModelLoaded {
+                    try await dm.load(variant: diarizationVariant.lseendVariant)
+                }
+                try await dm.feedAudio(samples)
+                await dm.finalize()
+                return true
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                Log.batchTranscription.warning("Speaker diarization unavailable for \(channelName, privacy: .public) audio, continuing without it: \(error, privacy: .public)")
+                return false
             }
         }
 
@@ -583,50 +606,50 @@ actor BatchAudioTranscriber {
 
         if let micURL = urls.mic {
             var micDiarizer: DiarizationManager?
-            if needsLSEENDForMic, let dm = batchDiarizer {
-                Log.batchTranscription.info("Running LS-EEND diarization on microphone audio...")
+            if needsDiarizationForMic, let dm = batchDiarizer {
+                Log.batchTranscription.info("Running diarization on microphone audio...")
                 let samples = try BatchAudioSampleReader.readAll(
                     url: micURL,
                     targetRate: 16000,
                     overrideSampleRate: anchors?.micSampleRate
                 )
-                try await dm.feedAudio(samples)
-                await dm.finalize()
-                micDiarizer = dm
-                let segments = await dm.speakerSegments()
-                micSpeakerSegments = segments
-                Log.batchTranscription.info("Microphone diarization complete")
+                if try await diarizeWholeFile(samples, with: dm, channelName: "microphone") {
+                    micDiarizer = dm
+                    let segments = await dm.speakerSegments()
+                    micSpeakerSegments = segments
+                    Log.batchTranscription.info("Microphone diarization complete")
 
-                // Match the enrolled voiceprint against the diarized speakers now,
-                // while the decoded samples are still in memory (before the ASR
-                // pass extends their lifetime).
-                if let profile = VoiceprintStore.load() {
-                    if segments.count >= 2 {
-                        do {
-                            micSelfIndex = try await SelfVoiceIdentifier.matchSelf(
-                                samples: samples,
-                                speakerSegments: segments,
-                                voiceprint: profile.embedding
-                            )
-                            if let index = micSelfIndex {
-                                Log.batchTranscription.info("Enrolled voice matched diarized mic speaker \(index, privacy: .public)")
-                            } else {
-                                Log.batchTranscription.info("No diarized mic speaker matched the enrolled voice profile")
+                    // Match the enrolled voiceprint against the diarized speakers now,
+                    // while the decoded samples are still in memory (before the ASR
+                    // pass extends their lifetime).
+                    if let profile = VoiceprintStore.load() {
+                        if segments.count >= 2 {
+                            do {
+                                micSelfIndex = try await SelfVoiceIdentifier.matchSelf(
+                                    samples: samples,
+                                    speakerSegments: segments,
+                                    voiceprint: profile.embedding
+                                )
+                                if let index = micSelfIndex {
+                                    Log.batchTranscription.info("Enrolled voice matched diarized mic speaker \(index, privacy: .public)")
+                                } else {
+                                    Log.batchTranscription.info("No diarized mic speaker matched the enrolled voice profile")
+                                }
+                            } catch {
+                                Log.batchTranscription.warning("Self-voice identification failed: \(error, privacy: .public)")
                             }
-                        } catch {
-                            Log.batchTranscription.warning("Self-voice identification failed: \(error, privacy: .public)")
                         }
                     }
-                }
 
-                // Extract per-speaker embeddings while the samples are still in
-                // memory — they feed speaker-library auto-naming and "Remember
-                // this voice" enrollment after the transcript is saved.
-                micSpeakerEmbeddings = await SelfVoiceIdentifier.speakerEmbeddings(
-                    samples: samples,
-                    speakerSegments: segments,
-                    excluding: micSelfIndex
-                )
+                    // Extract per-speaker embeddings while the samples are still in
+                    // memory — they feed speaker-library auto-naming and "Remember
+                    // this voice" enrollment after the transcript is saved.
+                    micSpeakerEmbeddings = await SelfVoiceIdentifier.speakerEmbeddings(
+                        samples: samples,
+                        speakerSegments: segments,
+                        excluding: micSelfIndex
+                    )
+                }
             }
 
             micRecords = try await transcribeFile(
@@ -656,18 +679,18 @@ actor BatchAudioTranscriber {
 
         if let sysURL = urls.sys {
             var sysDiarizer: DiarizationManager?
-            if needsLSEENDForSys, let dm = batchDiarizer {
-                Log.batchTranscription.info("Running LS-EEND diarization on system audio...")
+            if needsDiarizationForSys, let dm = batchDiarizer {
+                Log.batchTranscription.info("Running diarization on system audio...")
                 // Process complete audio file through diarizer
                 let samples = try BatchAudioSampleReader.readAll(
                     url: sysURL,
                     targetRate: 16000,
                     overrideSampleRate: anchors?.sysSampleRate
                 )
-                try await dm.feedAudio(samples)
-                await dm.finalize()
-                sysDiarizer = dm
-                Log.batchTranscription.info("Diarization complete")
+                if try await diarizeWholeFile(samples, with: dm, channelName: "system") {
+                    sysDiarizer = dm
+                    Log.batchTranscription.info("System diarization complete")
+                }
             } else if useElevenLabsNativeDiarization {
                 Log.batchTranscription.info("Using ElevenLabs native diarization for system audio")
             }
