@@ -294,11 +294,35 @@ actor BatchAudioTranscriber {
         case failed(String)
     }
 
-    private(set) var status: Status = .idle
+    private(set) var status: Status = .idle {
+        didSet {
+            // Terminal statuses must not persist: the poll loop mirrors this
+            // into coordinator.batchStatus, and a lingering .failed/.cancelled
+            // (or re-mirrored .completed) disables every re-transcribe menu
+            // item and pins the 250 ms poll loop active for the whole app run.
+            // 10 s gives the UI ample polls to surface the outcome first.
+            switch status {
+            case .completed, .cancelled, .failed:
+                let terminal = status
+                Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(10))
+                    await self?.resetStatusIfStillTerminal(terminal)
+                }
+            case .idle, .loading, .transcribing:
+                break
+            }
+        }
+    }
     /// True when the current batch job is an audio file import (affects UI copy).
     private(set) var isImporting: Bool = false
     private(set) var activeSessionID: String?
     private var currentTask: Task<Void, Never>?
+
+    private func resetStatusIfStillTerminal(_ terminal: Status) {
+        if status == terminal, currentTask == nil {
+            status = .idle
+        }
+    }
 
     /// Process batch transcription for a completed session.
     func process(
@@ -352,7 +376,13 @@ actor BatchAudioTranscriber {
         currentTask = nil
         task?.cancel()
         await task?.value
-        status = .cancelled
+        // Only mark cancelled when something was actually cancelled: this is
+        // called on every session start, and unconditionally leaving status at
+        // .cancelled disabled every re-transcribe menu item (isBatchBusy) and
+        // pinned the 250 ms poll loop active for the rest of the app run.
+        if task != nil {
+            status = .cancelled
+        }
         isImporting = false
         activeSessionID = nil
     }

@@ -276,9 +276,50 @@ final class AudioRecorder: @unchecked Sendable {
         guard !alreadySealed else { return }
 
         await Task.detached(priority: .userInitiated) { [self] in
-            self.mergeAndEncode()
-            self.cleanupTempFiles()
+            if self.mergeAndEncode() {
+                self.cleanupTempFiles()
+            } else {
+                // The temp CAFs are the only copy of the recording; deleting
+                // them after a failed merge (e.g. the whole-file read failing
+                // to allocate on a memory-constrained machine) would lose the
+                // audio outright. Drop the references but keep the files; the
+                // launch-time stale-stem sweep ages them out.
+                Log.recorder.error("Audio merge failed; keeping temp CAF stems on disk for recovery")
+                self.lock.withLock {
+                    self.micTempURL = nil
+                    self.sysTempURL = nil
+                }
+            }
         }.value
+    }
+
+    /// Delete temp CAF stems left behind by interrupted finalizations (crash,
+    /// force-quit, wedged stop). Sealed stems are moved into the session
+    /// directory during finalization, so a day-old stem still in the temp
+    /// directory is unreachable by any code path and is a pure disk leak
+    /// (observed: 200+ MB accumulated from wedged stops).
+    static func sweepStaleTempFiles(olderThan age: TimeInterval = 24 * 60 * 60) {
+        let fm = FileManager.default
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        guard let entries = try? fm.contentsOfDirectory(
+            at: tmp,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        let cutoff = Date().addingTimeInterval(-age)
+        for url in entries {
+            let name = url.lastPathComponent
+            guard name.hasSuffix(".caf"),
+                  name.hasPrefix("openoats_mic_") || name.hasPrefix("openoats_sys_")
+                    || name.hasPrefix("batch_mic_") || name.hasPrefix("batch_sys_")
+            else { continue }
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate ?? .distantPast
+            if modified < cutoff {
+                try? fm.removeItem(at: url)
+                Log.recorder.info("Swept stale temp stem \(name, privacy: .private(mask: .hash))")
+            }
+        }
     }
 
     // MARK: - Private
@@ -293,7 +334,9 @@ final class AudioRecorder: @unchecked Sendable {
         }
     }
 
-    private func mergeAndEncode() {
+    /// Returns true when the temp stems are safe to delete: either the merged
+    /// output was fully written, or there was nothing to merge.
+    private func mergeAndEncode() -> Bool {
         let (micURL, sysURL, dir, timestamp, sysEffectiveRate, dirIsSecurityScoped) = lock.withLock {
             let effectiveRate = Self.effectiveSystemSampleRate(
                 startDate: sysStartDate,
@@ -320,11 +363,11 @@ final class AudioRecorder: @unchecked Sendable {
 
         guard micReader != nil || sysReader != nil else {
             Log.recorder.info("No audio data recorded")
-            return
+            return true
         }
 
         let targetRate: Double = 48_000
-        guard let targetFormat = AVAudioFormat(standardFormatWithSampleRate: targetRate, channels: 1) else { return }
+        guard let targetFormat = AVAudioFormat(standardFormatWithSampleRate: targetRate, channels: 1) else { return false }
 
         if let mic = micReader {
             Log.recorder.info("Mic temp: \(mic.length, privacy: .public) frames, format=\(mic.processingFormat, privacy: .public)")
@@ -359,7 +402,12 @@ final class AudioRecorder: @unchecked Sendable {
         Log.recorder.info("After readAllMono: micSamples=\(micSamples.count, privacy: .public) micPeak=\(micPeak, privacy: .public) sysSamples=\(sysSamples.count, privacy: .public) sysPeak=\(sysPeak, privacy: .public)")
 
         let length = max(micSamples.count, sysSamples.count)
-        guard length > 0 else { return }
+        guard length > 0 else {
+            // Readers exist but no samples came back (whole-file read or
+            // buffer allocation failed): the stems still hold the audio.
+            Log.recorder.error("Audio merge read no samples from non-empty stems")
+            return false
+        }
 
         let outputURL = dir.appendingPathComponent("\(timestamp).m4a")
         guard let outputFile = try? AVAudioFile(
@@ -374,16 +422,20 @@ final class AudioRecorder: @unchecked Sendable {
             interleaved: false
         ) else {
             Log.recorder.error("Failed to create output file")
-            return
+            return false
         }
 
         // Write mixed audio in chunks
         let chunkSize = 65_536
         var offset = 0
+        var writeSucceeded = true
         while offset < length {
             let count = min(chunkSize, length - offset)
             guard let buffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: AVAudioFrameCount(count)),
-                  let out = buffer.floatChannelData?[0] else { break }
+                  let out = buffer.floatChannelData?[0] else {
+                writeSucceeded = false
+                break
+            }
             buffer.frameLength = AVAudioFrameCount(count)
 
             for i in 0..<count {
@@ -392,11 +444,15 @@ final class AudioRecorder: @unchecked Sendable {
                 out[i] = max(-1, min(1, m + s))
             }
 
-            do { try outputFile.write(from: buffer) } catch { break }
+            do { try outputFile.write(from: buffer) } catch {
+                writeSucceeded = false
+                break
+            }
             offset += count
         }
 
         Log.recorder.info("Saved \(outputURL.lastPathComponent, privacy: .private(mask: .hash)) (\(length, privacy: .public) frames)")
+        return writeSucceeded
     }
 
     private static func readAllMono(

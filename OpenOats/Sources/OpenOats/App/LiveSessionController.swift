@@ -569,6 +569,10 @@ final class LiveSessionController {
     // MARK: - Utterance Ingestion (migrated from ContentView)
 
     private func handleNewUtterance(_ last: Utterance, settings: AppSettings) {
+        // No active session (a late final from an abandoned transcriber, or a
+        // store append that slipped past finalize): nothing downstream can
+        // write it anywhere but the wrong place.
+        guard _currentSessionID != nil else { return }
         container.detectionController?.noteUtterance()
 
         if settings.enableLiveTranscriptCleanup, let engine = coordinator.liveTranscriptCleaner {
@@ -609,6 +613,18 @@ final class LiveSessionController {
         _currentSessionID
     }
     private var _currentSessionID: String?
+
+    /// Bumped whenever a session starts or is discarded. A finalization that
+    /// was watchdog-cancelled completes late rather than stopping (its awaits
+    /// are not cancellation-sensitive); every step after an await checks this
+    /// so a stale finalization can never close a newer session's files or
+    /// seal its recorder.
+    private var sessionGeneration = 0
+
+    /// The in-flight startTranscription task, retained so a stop that races
+    /// session startup can cancel it and wait for it to unwind instead of
+    /// letting it start capture for a session that already ended.
+    var activeStartTask: Task<Void, Never>?
 
     private static func appendingMarkdownBlock(_ block: String, to existing: String) -> String {
         guard !existing.isEmpty else { return block }
@@ -668,6 +684,8 @@ final class LiveSessionController {
     // MARK: - Transcription Lifecycle (migrated from AppCoordinator)
 
     func startTranscription(metadata: MeetingMetadata, settings: AppSettings?) async {
+        sessionGeneration += 1
+        defer { activeStartTask = nil }
         if let settings {
             container.ensureMeetingServicesInitialized(settings: settings, coordinator: coordinator)
         }
@@ -767,9 +785,31 @@ final class LiveSessionController {
     }
 
     func finalizeCurrentSession(settings: AppSettings?) async {
+        // A start still mid-flight (models loading) must not race this
+        // teardown: cancel it and give it a bounded moment to unwind, so it
+        // cannot start capture for a session that already ended.
+        if let startTask = activeStartTask {
+            startTask.cancel()
+            _ = await TranscriptionEngine.awaitTeardown(of: [startTask], timeoutSeconds: 5)
+            activeStartTask = nil
+        }
+
+        // Snapshot identity BEFORE any await: a watchdog-cancelled
+        // finalization completes late instead of stopping, and must only ever
+        // act on the session it was started for.
+        let generation = sessionGeneration
+        let sessionID: String
+        if let id = _currentSessionID {
+            sessionID = id
+        } else if let id = await coordinator.sessionRepository.getCurrentSessionID() {
+            sessionID = id
+        } else {
+            sessionID = "unknown"
+        }
+
         // 0. Flush scratchpad
         scratchpadSaveTask?.cancel()
-        if let sessionID = _currentSessionID, !state.scratchpadText.isEmpty {
+        if _currentSessionID != nil, !state.scratchpadText.isEmpty {
             await coordinator.sessionRepository.saveScratchpad(sessionID: sessionID, text: state.scratchpadText)
         }
 
@@ -785,18 +825,17 @@ final class LiveSessionController {
             await coordinator.liveTranscriptCleaner?.drain(timeout: .seconds(5))
         }
 
-        // 2. Drain delayed JSONL writes
-        await coordinator.sessionRepository.awaitPendingWrites()
+        // 2. Drain delayed JSONL writes (bounded: a wedged writer must not
+        // hang the stop chain).
+        let pendingWrites = Task { await coordinator.sessionRepository.awaitPendingWrites() }
+        _ = await TranscriptionEngine.awaitTeardown(of: [pendingWrites], timeoutSeconds: 8)
+
+        guard sessionGeneration == generation else {
+            Self.recordStaleFinalization(of: sessionID, step: "post-drain")
+            return
+        }
 
         // 3. Build finalization metadata
-        let sessionID: String
-        if let id = _currentSessionID {
-            sessionID = id
-        } else if let id = await coordinator.sessionRepository.getCurrentSessionID() {
-            sessionID = id
-        } else {
-            sessionID = "unknown"
-        }
         let utterancesSnapshot = coordinator.transcriptStore.utterances
         let utteranceCount = utterancesSnapshot.count
         let endingMetadata: MeetingMetadata?
@@ -868,6 +907,11 @@ final class LiveSessionController {
             transcriptIssue: transcriptIssue
         )
 
+        guard sessionGeneration == generation else {
+            Self.recordStaleFinalization(of: sessionID, step: "post-sidecar")
+            return
+        }
+
         // 5b. Fire webhook if configured
         if let settings {
             WebhookService.fireIfEnabled(
@@ -898,27 +942,24 @@ final class LiveSessionController {
             if wantsBatch && wantsExport {
                 let tempURLs = recorder.tempFileURLs()
                 let anchorsData = recorder.timingAnchors()
-                let fm = FileManager.default
 
-                let copiedMic: URL?
-                if let micSrc = tempURLs.mic, fm.fileExists(atPath: micSrc.path) {
-                    let dst = URL(fileURLWithPath: NSTemporaryDirectory())
-                        .appendingPathComponent("batch_mic_\(sessionID).caf")
-                    try? fm.copyItem(at: micSrc, to: dst)
-                    copiedMic = dst
-                } else {
-                    copiedMic = nil
-                }
-
-                let copiedSys: URL?
-                if let sysSrc = tempURLs.sys, fm.fileExists(atPath: sysSrc.path) {
-                    let dst = URL(fileURLWithPath: NSTemporaryDirectory())
-                        .appendingPathComponent("batch_sys_\(sessionID).caf")
-                    try? fm.copyItem(at: sysSrc, to: dst)
-                    copiedSys = dst
-                } else {
-                    copiedSys = nil
-                }
+                // Off-main: these are full-length recording CAFs (GBs for a
+                // long meeting) and a synchronous copy here beachballs the
+                // whole app the moment the user hits Stop.
+                let (copiedMic, copiedSys): (URL?, URL?) = await Task.detached {
+                    let fm = FileManager.default
+                    func copyStem(_ src: URL?, name: String) -> URL? {
+                        guard let src, fm.fileExists(atPath: src.path) else { return nil }
+                        let dst = URL(fileURLWithPath: NSTemporaryDirectory())
+                            .appendingPathComponent(name)
+                        try? fm.copyItem(at: src, to: dst)
+                        return fm.fileExists(atPath: dst.path) ? dst : nil
+                    }
+                    return (
+                        copyStem(tempURLs.mic, name: "batch_mic_\(sessionID).caf"),
+                        copyStem(tempURLs.sys, name: "batch_sys_\(sessionID).caf")
+                    )
+                }.value
 
                 retainedBatchAudio = copiedMic != nil || copiedSys != nil
                 await coordinator.sessionRepository.stashAudioForBatch(
@@ -955,6 +996,11 @@ final class LiveSessionController {
             } else {
                 recorder.discardRecording()
             }
+        }
+
+        guard sessionGeneration == generation else {
+            Self.recordStaleFinalization(of: sessionID, step: "post-audio")
+            return
         }
 
         // 7. Collapse obviously empty duplicate sessions back into the real meeting session.
@@ -1034,6 +1080,11 @@ final class LiveSessionController {
             coordinator.pendingRecoverySessionID = nil
         }
 
+        guard sessionGeneration == generation else {
+            Self.recordStaleFinalization(of: sessionID, step: "post-reconcile")
+            return
+        }
+
         // 8. Update UI state + refresh history
         coordinator.lastEndedSession = effectiveIndex
         set(\.lastEndedSessionCanRetranscribe, retainedBatchAudio)
@@ -1080,6 +1131,13 @@ final class LiveSessionController {
                 )
             }
         }
+    }
+
+    private static func recordStaleFinalization(of sessionID: String, step: String) {
+        DiagnosticsSupport.record(
+            category: "meeting",
+            message: "Stale finalization of \(sessionID) aborted at \(step) (newer session active)"
+        )
     }
 
     private func scheduleAutoNotesIfNeeded(
@@ -1446,16 +1504,22 @@ final class LiveSessionController {
     }
 
     func discardSession() {
+        sessionGeneration += 1
+        activeStartTask?.cancel()
+        activeStartTask = nil
         coordinator.transcriptionEngine?.stop()
         coordinator.audioRecorder?.discardRecording()
         coordinator.transcriptStore.clear()
         coordinator.pendingRecoverySessionID = nil
-        if let sessionID = _currentSessionID {
-            DiagnosticsSupport.record(category: "meeting", message: "Discarded session \(sessionID)")
+        let discardedSessionID = _currentSessionID
+        if let discardedSessionID {
+            DiagnosticsSupport.record(category: "meeting", message: "Discarded session \(discardedSessionID)")
         }
         _currentSessionID = nil
         Task {
-            await coordinator.sessionRepository.endSession()
+            // Session-checked: a quick restart after discard must not have its
+            // fresh live file handle closed by this stale teardown.
+            await coordinator.sessionRepository.endSession(sessionID: discardedSessionID)
         }
     }
 

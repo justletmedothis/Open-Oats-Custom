@@ -155,6 +155,12 @@ final class AppCoordinator {
     /// The active finalization task, retained so the timeout can cancel it.
     private var finalizationTask: Task<Void, Never>?
 
+    /// Identity of the finalization currently in flight. A finalization that
+    /// was watchdog-cancelled but completes late (its awaits are not
+    /// cancellation-sensitive, so it runs to the end) must not cancel a NEWER
+    /// session's watchdog or force its .ending → .idle transition.
+    private var finalizationGeneration: UUID?
+
     /// Retained reference to the active settings for side effects.
     var activeSettings: AppSettings?
 
@@ -201,17 +207,31 @@ final class AppCoordinator {
 
         switch event {
         case .userStarted(let metadata):
-            Task { await liveSessionController?.startTranscription(metadata: metadata, settings: settings) }
+            let startTask = Task { () -> Void in
+                _ = await liveSessionController?.startTranscription(metadata: metadata, settings: settings)
+            }
+            liveSessionController?.activeStartTask = startTask
 
         case .userStopped:
+            let generation = UUID()
+            finalizationGeneration = generation
+            // 120 s: teardown is bounded (engine awaits are all time-boxed),
+            // so anything long-running here is legitimate work — merging a
+            // long meeting's audio can exceed the old 30 s and must not be
+            // cancelled into the late-finalization race.
             finalizationTimeoutTask = Task {
-                try? await Task.sleep(for: .seconds(30))
-                guard !Task.isCancelled else { return }
+                try? await Task.sleep(for: .seconds(120))
+                guard !Task.isCancelled, finalizationGeneration == generation else { return }
+                DiagnosticsSupport.record(
+                    category: "meeting",
+                    message: "Finalization watchdog fired after 120s; forcing idle"
+                )
                 finalizationTask?.cancel()
                 handle(.finalizationTimeout)
             }
             finalizationTask = Task {
                 await liveSessionController?.finalizeCurrentSession(settings: settings)
+                guard finalizationGeneration == generation else { return }
                 finalizationTimeoutTask?.cancel()
                 finalizationTimeoutTask = nil
                 handle(.finalizationComplete)

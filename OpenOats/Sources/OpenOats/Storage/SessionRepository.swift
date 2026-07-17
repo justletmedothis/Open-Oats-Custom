@@ -469,7 +469,13 @@ actor SessionRepository {
     }
 
     /// End a session without full finalization (discard path).
-    func endSession() {
+    /// Pass the session being ended so a stale caller (a discard racing a
+    /// quick restart) cannot close the live file handle of a session that
+    /// started after it. Passing nil keeps the unconditional behavior.
+    func endSession(sessionID: String? = nil) {
+        if let sessionID, let current = currentSessionID, current != sessionID {
+            return
+        }
         try? liveFileHandle?.close()
         liveFileHandle = nil
         currentSessionID = nil

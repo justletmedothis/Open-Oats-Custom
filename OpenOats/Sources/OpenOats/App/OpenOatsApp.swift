@@ -40,6 +40,9 @@ public struct OpenOatsRootApp: App {
             defaults: context.container.defaults
         )
         DiagnosticsSupport.record(category: "app", message: "App initialized")
+        Task.detached(priority: .background) {
+            AudioRecorder.sweepStaleTempFiles()
+        }
     }
 
     public var body: some Scene {
@@ -448,6 +451,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return .terminateNow
         }
 
+        // A stop is already in flight: quitting now would kill the process
+        // mid-finalization (sidecar unwritten, audio still in temp). Wait for
+        // idle; no alert needed since the user already stopped.
+        if case .ending = coordinator.state {
+            isTerminating = true
+            waitForIdleThenTerminate(coordinator: coordinator)
+            return .terminateLater
+        }
+
         guard coordinator.isRecording else {
             return .terminateNow
         }
@@ -466,9 +478,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         isTerminating = true
         coordinator.handle(.userStopped, settings: settings)
+        waitForIdleThenTerminate(coordinator: coordinator)
+        return .terminateLater
+    }
 
+    /// Deadline matches the finalization watchdog (120 s): a long meeting's
+    /// audio merge is legitimate work and must not be cut short at quit.
+    private func waitForIdleThenTerminate(coordinator: AppCoordinator) {
         Task { @MainActor [weak self] in
-            let deadline = Date().addingTimeInterval(30)
+            let deadline = Date().addingTimeInterval(120)
             while Date() < deadline {
                 if case .idle = coordinator.state { break }
                 try? await Task.sleep(for: .milliseconds(100))
@@ -476,7 +494,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.isTerminating = true
             NSApp.reply(toApplicationShouldTerminate: true)
         }
-        return .terminateLater
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
