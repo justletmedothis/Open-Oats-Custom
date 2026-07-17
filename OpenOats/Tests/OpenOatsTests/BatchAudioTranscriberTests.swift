@@ -302,6 +302,32 @@ final class BatchAudioTranscriberTests: XCTestCase {
         XCTAssertEqual(absorbed.map(\.speaker), [.local(1), .local(2)])
     }
 
+    func testDemoteLoneGuestVoiceRelabelsYouAsSpeakerA() {
+        // A single diarized mic voice collapses to .you; when the voiceprint
+        // check finds it is a guest, every .you record becomes Speaker A so the
+        // guest is never saved as the user.
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let records = [
+            SessionRecord(speaker: .you, text: "hey thanks for meeting", timestamp: base),
+            SessionRecord(speaker: .you, text: "so about the roadmap", timestamp: base.addingTimeInterval(4)),
+        ]
+        let demoted = BatchAudioTranscriber.demoteLoneGuestVoice(in: records)
+        XCTAssertEqual(demoted.map(\.speaker), [.local(1), .local(1)])
+    }
+
+    func testDemoteLoneGuestVoiceLeavesOtherSpeakersUntouched() {
+        // Defensive: only .you (the collapsed mic voice) is demoted; system-side
+        // and already-lettered records pass through unchanged.
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let records = [
+            SessionRecord(speaker: .you, text: "guest talking alone", timestamp: base),
+            SessionRecord(speaker: .them, text: "call audio", timestamp: base.addingTimeInterval(2)),
+            SessionRecord(speaker: .local(2), text: "another local", timestamp: base.addingTimeInterval(4)),
+        ]
+        let demoted = BatchAudioTranscriber.demoteLoneGuestVoice(in: records)
+        XCTAssertEqual(demoted.map(\.speaker), [.local(1), .them, .local(2)])
+    }
+
     private func makeRecords(
         count: Int,
         startedAt: Date,

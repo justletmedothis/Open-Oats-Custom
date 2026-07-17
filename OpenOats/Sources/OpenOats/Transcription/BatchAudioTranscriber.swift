@@ -600,6 +600,10 @@ actor BatchAudioTranscriber {
         }
 
         var micSelfIndex: Int?
+        // Set when a single diarized mic voice (collapsed to .you) is verified
+        // against the enrolled voiceprint and turns out to be a guest, not the
+        // user — those .you records get lettered instead.
+        var micLoneVoiceIsGuest = false
         var micSpeakerSegments: [Int: [DiarizationManager.SpeakerSegment]]?
         var micSpeakerEmbeddings: [Int: [Float]] = [:]
         var sysSpeechRanges: [(start: Date, end: Date)] = []
@@ -637,6 +641,21 @@ actor BatchAudioTranscriber {
                                 }
                             } catch {
                                 Log.batchTranscription.warning("Self-voice identification failed: \(error, privacy: .public)")
+                            }
+                        } else if segments.count == 1, let loneSegments = segments.first?.value {
+                            // Single diarized mic voice: the slice pass collapses it
+                            // to .you ("lone mic voice = the user"). With a voiceprint
+                            // enrolled, verify that assumption — a guest talking near
+                            // the Mac while the user is silent must not be saved as
+                            // "You".
+                            let isSelf = await SelfVoiceIdentifier.loneVoiceIsSelf(
+                                samples: samples,
+                                segments: loneSegments,
+                                voiceprint: profile.embedding
+                            )
+                            if !isSelf {
+                                micLoneVoiceIsGuest = true
+                                Log.batchTranscription.info("Lone diarized mic voice did not match the enrolled profile; labeling as a guest speaker")
                             }
                         }
                     }
@@ -791,9 +810,17 @@ actor BatchAudioTranscriber {
             guard let finalNumber = finalNumberByOriginal[index + 1] else { continue }
             speakerKeyEmbeddings[Speaker.local(finalNumber).storageKey] = embedding
         }
+        // The lone-guest voice carries no .local record to key from, so key its
+        // embedding to Speaker A directly (feeds library auto-naming/enrollment).
+        if micLoneVoiceIsGuest, let loneIndex = micSpeakerSegments?.keys.first,
+           let embedding = micSpeakerEmbeddings[loneIndex] {
+            speakerKeyEmbeddings[Speaker.local(1).storageKey] = embedding
+        }
 
         if let selfIndex = micSelfIndex {
             micRecords = Self.relabelSelfSpeaker(in: micRecords, selfIndex: selfIndex)
+        } else if micLoneVoiceIsGuest {
+            micRecords = Self.demoteLoneGuestVoice(in: micRecords)
         } else {
             micRecords = Self.reletterLocalSpeakers(in: micRecords)
         }
@@ -1093,6 +1120,16 @@ actor BatchAudioTranscriber {
         return records.map { record in
             guard let mapped = mapping[record.speaker], mapped != record.speaker else { return record }
             return record.withSpeaker(mapped)
+        }
+    }
+
+    /// Relabel a collapsed lone "You" mic voice (single-speaker diarization the
+    /// slice pass defaulted to .you) as Speaker A. Used when the voiceprint check
+    /// finds that lone voice is a guest, not the enrolled user, so a guest
+    /// talking alone near the Mac is not saved as "You".
+    static func demoteLoneGuestVoice(in records: [SessionRecord]) -> [SessionRecord] {
+        records.map { record in
+            record.speaker == .you ? record.withSpeaker(.local(1)) : record
         }
     }
 

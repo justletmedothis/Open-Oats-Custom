@@ -11,6 +11,12 @@ enum SelfVoiceIdentifier {
     /// The best candidate must beat the runner-up by this margin, so two in-room
     /// voices that both hover near the threshold never get a coin-flip match.
     static let minRunnerUpGap: Float = 0.05
+    /// Ceiling for accepting a lone diarized mic voice as the enrolled user when
+    /// there is no runner-up to compare against. Stricter than maxMatchDistance
+    /// (same reason LiveSelfVoiceMatcher is): with a single candidate the
+    /// runner-up-margin safeguard is unavailable, so a guest talking alone near
+    /// the Mac must clear a tighter bar before being labeled "You".
+    static let loneVoiceMatchDistance: Float = 0.55
     /// The embedding model reads at most 10 s of audio per inference.
     static let maxClipSeconds: Double = 10.0
     /// Speakers with less diarized audio than this are not scored.
@@ -92,6 +98,33 @@ enum SelfVoiceIdentifier {
             return nil
         }
         return best.index
+    }
+
+    /// Verify whether the single diarized mic voice (the "lone voice = you"
+    /// collapse) is actually the enrolled user. There is no runner-up to compare
+    /// against, so it accepts only at loneVoiceMatchDistance. Returns true when
+    /// the voice confidently matches the voiceprint OR there is too little clean
+    /// speech to judge (falling back to the historical "lone mic voice is the
+    /// user" assumption rather than mislabeling); false means it is a guest who
+    /// should be lettered instead of labeled "You".
+    static func loneVoiceIsSelf(
+        samples: [Float],
+        segments: [DiarizationManager.SpeakerSegment],
+        voiceprint: [Float]
+    ) async -> Bool {
+        let clip = clip(from: samples, segments: segments)
+        guard Double(clip.count) / sampleRate >= minClipSeconds else { return true }
+        guard let models = try? await DiarizerModels.downloadIfNeeded() else { return true }
+        let manager = DiarizerManager()
+        manager.initialize(models: models)
+        defer { manager.cleanup() }
+
+        guard let embedding = try? manager.extractSpeakerEmbedding(from: clip),
+              manager.validateEmbedding(embedding) else { return true }
+        let distance = SpeakerUtilities.cosineDistance(embedding, voiceprint)
+        Log.diarization.info("Lone mic voice self-check: distance \(distance, privacy: .public)")
+        guard distance.isFinite else { return true }
+        return distance <= loneVoiceMatchDistance
     }
 
     /// Extract one embedding per diarized speaker with enough audio, keyed by

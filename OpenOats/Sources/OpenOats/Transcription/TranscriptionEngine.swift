@@ -1004,45 +1004,57 @@ final class TranscriptionEngine {
                     store.volatileYouText = ""
                     var speaker: Speaker = .you
                     if let self, let dm = self.micDiarizationManager {
-                        speaker = await dm.dominantSpeaker(
+                        let diarized = await dm.dominantSpeaker(
                             from: segment.startTime,
                             to: segment.endTime,
                             channel: .microphone
                         )
                         if let matcher = self.selfVoiceMatcher {
-                            if case .local(let n) = speaker {
-                                if await matcher.isSelf(localSpeakerNumber: n) {
-                                    speaker = .you
-                                } else if case .isSelf = await matcher.classifyUtterance(
+                            // A voiceprint is enrolled: "You" is earned by matching
+                            // the voiceprint, never assumed from speaking first. A
+                            // mic voice stays a provisional "Speaker" until the
+                            // voiceprint confirms it is the user, so a guest who
+                            // speaks first is never labeled "You". Resolve the raw
+                            // diarizer index (dominantSpeaker collapses a lone voice
+                            // to .you; dominantIndex keeps the real index).
+                            let rawIndex = await dm.dominantIndex(
+                                from: segment.startTime, to: segment.endTime
+                            )
+                            let n: Int
+                            if case .local(let localN) = diarized {
+                                n = localN
+                            } else if let rawIndex {
+                                n = rawIndex + 1
+                            } else {
+                                n = 1
+                            }
+
+                            if await matcher.isSelf(localSpeakerNumber: n) {
+                                speaker = .you
+                            } else if await matcher.isNotSelf(localSpeakerNumber: n) {
+                                speaker = .local(n)
+                            } else {
+                                switch await matcher.classifyUtterance(
                                     localSpeakerNumber: n,
                                     startTime: segment.startTime,
                                     endTime: segment.endTime
                                 ) {
-                                    // Just identified as the user — catch earlier
-                                    // bubbles up too.
+                                case .isSelf:
+                                    // Just confirmed as the user — promote this
+                                    // voice's earlier provisional bubbles too.
                                     speaker = .you
                                     store.relabel(from: .local(n), to: .you)
-                                }
-                            } else if speaker == .you,
-                                      let index = await dm.dominantIndex(
-                                        from: segment.startTime, to: segment.endTime
-                                      ) {
-                                // Single-voice collapse assumed the lone mic voice
-                                // is the user. Verify against the voiceprint: a
-                                // guest talking near the Mac while the user is
-                                // quiet must not be transcribed as "You".
-                                let n = index + 1
-                                if await matcher.isNotSelf(localSpeakerNumber: n) {
+                                case .notSelf, .pending:
+                                    // Decisively someone else, or not yet scored:
+                                    // keep the provisional "Speaker" label rather
+                                    // than guessing "You".
                                     speaker = .local(n)
-                                } else if case .notSelf = await matcher.classifyUtterance(
-                                    localSpeakerNumber: n,
-                                    startTime: segment.startTime,
-                                    endTime: segment.endTime
-                                ) {
-                                    speaker = .local(n)
-                                    store.relabel(from: .you, to: .local(n))
                                 }
                             }
+                        } else {
+                            // No voiceprint enrolled: fall back to the "mic = you"
+                            // default (a lone mic voice is presumed to be the user).
+                            speaker = diarized
                         }
                     }
                     store.append(
