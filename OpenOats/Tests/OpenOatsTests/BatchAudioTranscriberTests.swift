@@ -200,6 +200,54 @@ final class BatchAudioTranscriberTests: XCTestCase {
         XCTAssertEqual(slices.map(\.sampleCount), [36_800, 27_200])
     }
 
+    func testReconcileLiveSpeakerNamesFollowsVoiceAcrossRelettering() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        // Live: the user named live "Speaker A" (local_1), speaking 10-20s.
+        let liveRecords = [
+            SessionRecord(speaker: .local(1), text: "hi", timestamp: base,
+                          startTime: 10, endTime: 20, source: .microphone),
+            SessionRecord(speaker: .local(2), text: "yo", timestamp: base,
+                          startTime: 30, endTime: 40, source: .microphone),
+        ]
+        // Batch relettered: the voice at 10-20s is now local_2.
+        let finalRecords = [
+            SessionRecord(speaker: .local(2), text: "hi there", timestamp: base,
+                          startTime: 9, endTime: 21, source: .microphone),
+            SessionRecord(speaker: .local(1), text: "yo", timestamp: base,
+                          startTime: 29, endTime: 41, source: .microphone),
+        ]
+        let names = BatchAudioTranscriber.reconcileLiveSpeakerNames(
+            liveNames: ["local_1": "Matt"],
+            liveRecords: liveRecords,
+            finalRecords: finalRecords
+        )
+        XCTAssertEqual(names, ["local_2": "Matt"], "name follows the voice, not the letter")
+    }
+
+    func testReconcileLiveSpeakerNamesNeverNamesYouAndStaysInChannel() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let liveRecords = [
+            SessionRecord(speaker: .local(1), text: "a", timestamp: base,
+                          startTime: 0, endTime: 10, source: .microphone),
+            SessionRecord(speaker: .remote(1), text: "b", timestamp: base,
+                          startTime: 0, endTime: 10, source: .system),
+        ]
+        // The mic voice turned out to be the user; the remote voice relettered.
+        let finalRecords = [
+            SessionRecord(speaker: .you, text: "a", timestamp: base,
+                          startTime: 0, endTime: 10, source: .microphone),
+            SessionRecord(speaker: .remote(2), text: "b", timestamp: base,
+                          startTime: 0, endTime: 10, source: .system),
+        ]
+        let names = BatchAudioTranscriber.reconcileLiveSpeakerNames(
+            liveNames: ["local_1": "Guest", "remote_1": "Dana"],
+            liveRecords: liveRecords,
+            finalRecords: finalRecords
+        )
+        XCTAssertEqual(names, ["remote_2": "Dana"],
+                       "you is never renamed; remote name follows within its channel")
+    }
+
     func testAbsorbThinMicSpeakersReassignsToNearestSurvivor() {
         let base = Date(timeIntervalSince1970: 1_700_000_000)
         let records = [

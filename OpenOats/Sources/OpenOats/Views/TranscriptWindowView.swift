@@ -2,6 +2,7 @@ import SwiftUI
 
 struct TranscriptWindowView: View {
     @Environment(TranscriptStore.self) private var store
+    @Environment(AppCoordinator.self) private var coordinator
 
     var body: some View {
         VStack(spacing: 0) {
@@ -30,7 +31,19 @@ struct TranscriptWindowView: View {
                 utterances: store.utterances,
                 volatileYouText: store.volatileYouText,
                 volatileThemText: store.volatileThemText,
-                showSearch: true
+                showSearch: true,
+                speakerNames: {
+                    let names = coordinator.liveSessionController?.state.liveSpeakerNames ?? [:]
+                    return names.isEmpty ? nil : names
+                }(),
+                nameSuggestions: coordinator.liveSessionController?.state.matchedCalendarEvent?
+                    .participants.compactMap(\.displayName) ?? [],
+                onRenameSpeaker: coordinator.liveSessionController.map { c in
+                    { c.renameLiveSpeaker($0, to: $1) }
+                },
+                onNotMe: coordinator.liveSessionController.map { c in
+                    { c.markLiveUtteranceNotMe($0) }
+                }
             )
         }
         .frame(minWidth: 400, minHeight: 500)

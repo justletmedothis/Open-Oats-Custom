@@ -127,7 +127,7 @@ struct ContentView: View {
                 // Collapsible transcript (hidden when live transcript is disabled)
                 if controllerState.showLiveTranscript {
                     DisclosureGroup(isExpanded: $isTranscriptExpanded) {
-                        IsolatedTranscriptWrapper(state: controllerState)
+                        IsolatedTranscriptWrapper(state: controllerState, controller: liveSessionController)
                             .frame(height: 210)
                     } label: {
                         HStack(spacing: 6) {
@@ -720,6 +720,7 @@ private struct ScratchpadSection: View {
 
 private struct IsolatedTranscriptWrapper: View {
     let state: LiveSessionState
+    var controller: LiveSessionController? = nil
 
     var body: some View {
         TranscriptView(
@@ -727,7 +728,11 @@ private struct IsolatedTranscriptWrapper: View {
             emptyStateMessage: state.liveTranscriptEmptyStateMessage,
             volatileYouText: state.volatileYouText,
             volatileThemText: state.volatileThemText,
-            showSearch: true
+            showSearch: true,
+            speakerNames: state.liveSpeakerNames.isEmpty ? nil : state.liveSpeakerNames,
+            nameSuggestions: state.matchedCalendarEvent?.participants.compactMap(\.displayName) ?? [],
+            onRenameSpeaker: controller.map { c in { c.renameLiveSpeaker($0, to: $1) } },
+            onNotMe: controller.map { c in { c.markLiveUtteranceNotMe($0) } }
         )
     }
 }

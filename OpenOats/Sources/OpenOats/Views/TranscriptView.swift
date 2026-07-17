@@ -6,10 +6,20 @@ struct TranscriptView: View {
     let volatileYouText: String
     let volatileThemText: String
     var showSearch: Bool = false
+    /// Live speaker names (storageKey → name) for display.
+    var speakerNames: [String: String]? = nil
+    /// Attendee names offered as one-click naming suggestions.
+    var nameSuggestions: [String] = []
+    /// When set, lettered speakers can be named from the bubble context menu.
+    var onRenameSpeaker: ((Speaker, String) -> Void)? = nil
+    /// When set, You-labeled mic lines get a "Not me" correction action.
+    var onNotMe: ((Utterance) -> Void)? = nil
 
     @State private var searchText = ""
     @State private var autoScrollEnabled = true
     @State private var volatileScrollTask: Task<Void, Never>?
+    @State private var renamingSpeaker: Speaker? = nil
+    @State private var renameText = ""
 
     private var filteredUtterances: [Utterance] {
         guard !searchText.isEmpty else { return utterances }
@@ -29,6 +39,46 @@ struct TranscriptView: View {
                 Divider()
             }
             transcriptScrollView
+        }
+        .alert(
+            "Name \(renamingSpeaker?.displayLabel ?? "speaker")",
+            isPresented: Binding(
+                get: { renamingSpeaker != nil },
+                set: { if !$0 { renamingSpeaker = nil } }
+            )
+        ) {
+            TextField("Name", text: $renameText)
+            Button("Save") {
+                if let speaker = renamingSpeaker {
+                    onRenameSpeaker?(speaker, renameText)
+                }
+                renamingSpeaker = nil
+            }
+            Button("Cancel", role: .cancel) { renamingSpeaker = nil }
+        } message: {
+            Text("The name applies to every line from this speaker, feeds the meeting notes, and survives the post-meeting re-transcription.")
+        }
+    }
+
+    /// Context-menu corrections available on live bubbles.
+    @ViewBuilder
+    private func liveCorrectionMenu(for utterance: Utterance) -> some View {
+        if let onRenameSpeaker, utterance.speaker.isRenameable {
+            let label = utterance.speaker.displayName(speakerNames: speakerNames)
+            let usedNames = Set(speakerNames?.values.map { $0 } ?? [])
+            ForEach(nameSuggestions.filter { !usedNames.contains($0) }, id: \.self) { name in
+                Button("\(label) is \(name)") {
+                    onRenameSpeaker(utterance.speaker, name)
+                }
+            }
+            Button("Name \(label)…") {
+                renameText = speakerNames?[utterance.speaker.storageKey] ?? ""
+                renamingSpeaker = utterance.speaker
+            }
+        }
+        if let onNotMe, utterance.speaker == .you, utterance.source != .system {
+            Divider()
+            Button("Not me") { onNotMe(utterance) }
         }
     }
 
@@ -102,10 +152,12 @@ struct TranscriptView: View {
                             let utterance = visible[index]
                             UtteranceBubble(
                                 utterance: utterance,
-                                showTimestamp: shouldShowTimestamp(at: index, in: visible)
+                                showTimestamp: shouldShowTimestamp(at: index, in: visible),
+                                displayName: speakerNames?[utterance.speaker.storageKey]
                             )
                             .id(utterance.id)
                             .transition(.opacity)
+                            .contextMenu { liveCorrectionMenu(for: utterance) }
                         }
 
                         if !isSearching {
@@ -202,6 +254,8 @@ private let timestampFormatter: DateFormatter = {
 private struct UtteranceBubble: View {
     let utterance: Utterance
     var showTimestamp: Bool = true
+    /// Custom name assigned during the live session, overriding the label.
+    var displayName: String? = nil
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -215,7 +269,7 @@ private struct UtteranceBubble: View {
                     .frame(width: 34)
             }
 
-            Text(utterance.speaker.displayLabel)
+            Text(displayName ?? utterance.speaker.displayLabel)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(utterance.speaker.color)
                 .frame(minWidth: 36, alignment: .trailing)

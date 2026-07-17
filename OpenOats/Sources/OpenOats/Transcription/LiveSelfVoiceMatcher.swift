@@ -51,16 +51,42 @@ actor LiveSelfVoiceMatcher {
         }
     }
 
+    /// Outcome of scoring a diarized voice against the enrolled voiceprint.
+    enum Verdict: Sendable {
+        /// Not enough evidence yet to say either way.
+        case pending
+        /// The voice matches the enrolled voiceprint.
+        case isSelf
+        /// The voice was scored and is decisively not the user.
+        case notSelf
+    }
+
     /// Whether a diarizer-lettered local speaker has been identified as the user.
     func isSelf(localSpeakerNumber: Int) -> Bool {
         selfIndices.contains(localSpeakerNumber)
     }
 
-    /// Record a finalized utterance attributed to .local(n) and score the
-    /// speaker's voice once enough audio has accumulated. Returns true when
-    /// this call identified the speaker as the user (caller may relabel).
-    func noteUtterance(localSpeakerNumber n: Int, startTime: TimeInterval, endTime: TimeInterval) async -> Bool {
-        guard !decided.contains(n) else { return false }
+    /// Whether a speaker has been decisively scored as someone else.
+    func isNotSelf(localSpeakerNumber n: Int) -> Bool {
+        decided.contains(n) && !selfIndices.contains(n)
+    }
+
+    /// Force-mark a speaker as not the user (live "Not me" correction).
+    func markNotSelf(localSpeakerNumber n: Int) {
+        decided.insert(n)
+        selfIndices.remove(n)
+        clips[n] = nil
+    }
+
+    /// Record a finalized utterance attributed to a diarized speaker and score
+    /// that voice once enough audio has accumulated. `.isSelf` is returned only
+    /// on the call that first identifies the user (caller may relabel).
+    func classifyUtterance(
+        localSpeakerNumber n: Int, startTime: TimeInterval, endTime: TimeInterval
+    ) async -> Verdict {
+        guard !decided.contains(n) else {
+            return selfIndices.contains(n) ? .pending : .notSelf
+        }
 
         appendClip(for: n, startTime: startTime, endTime: endTime)
         let clipSeconds = Double(clips[n]?.count ?? 0) / Self.sampleRate
@@ -69,7 +95,7 @@ actor LiveSelfVoiceMatcher {
         let readyForRescore = clipSeconds >= Self.rescoreSeconds && scoredOnce.contains(n)
         guard readyForFirstScore || readyForRescore,
               clipSeconds >= minNextScoreSeconds[n] ?? 0,
-              let clip = clips[n] else { return false }
+              let clip = clips[n] else { return .pending }
 
         do {
             let embedding = try await SelfVoiceIdentifier.extractEmbedding(from: clip)
@@ -80,13 +106,13 @@ actor LiveSelfVoiceMatcher {
                 decided.insert(n)
                 selfIndices.insert(n)
                 clips[n] = nil
-                return true
+                return .isSelf
             }
             if distance > SelfVoiceIdentifier.maxMatchDistance || readyForRescore {
                 // Clearly another voice, or borderline twice — stop scoring.
                 decided.insert(n)
                 clips[n] = nil
-                return false
+                return .notSelf
             }
             scoredOnce.insert(n)
         } catch SelfVoiceIdentifier.EnrollmentError.notEnoughSpeech {
@@ -97,7 +123,7 @@ actor LiveSelfVoiceMatcher {
             Log.diarization.error("Live self-voice scoring failed: \(error, privacy: .public)")
             scoredOnce.insert(n)
         }
-        return false
+        return .pending
     }
 
     private func appendClip(for n: Int, startTime: TimeInterval, endTime: TimeInterval) {

@@ -221,6 +221,19 @@ final class TranscriptionEngine {
     private var diarizationManager: DiarizationManager?
     /// LS-EEND on the mic channel: live in-person speaker splitting.
     private var micDiarizationManager: DiarizationManager?
+
+    /// Live "Not me" correction on a You-labeled mic utterance: marks the
+    /// voice behind that time range as not the user and returns the lettered
+    /// speaker its records should move to (nil when mic diarization is idle).
+    func markMicVoiceNotSelf(startTime: TimeInterval, endTime: TimeInterval) async -> Speaker? {
+        guard let dm = micDiarizationManager,
+              let index = await dm.dominantIndex(from: startTime, to: endTime) else { return nil }
+        let n = index + 1
+        if let matcher = selfVoiceMatcher {
+            await matcher.markNotSelf(localSpeakerNumber: n)
+        }
+        return .local(n)
+    }
     /// Live scoring of lettered mic speakers against the enrolled voiceprint.
     private var selfVoiceMatcher: LiveSelfVoiceMatcher?
 
@@ -998,18 +1011,39 @@ final class TranscriptionEngine {
                             to: segment.endTime,
                             channel: .microphone
                         )
-                        if case .local(let n) = speaker, let matcher = self.selfVoiceMatcher {
-                            if await matcher.isSelf(localSpeakerNumber: n) {
-                                speaker = .you
-                            } else if await matcher.noteUtterance(
-                                localSpeakerNumber: n,
-                                startTime: segment.startTime,
-                                endTime: segment.endTime
-                            ) {
-                                // Just identified as the user — catch earlier
-                                // bubbles up too.
-                                speaker = .you
-                                store.relabel(from: .local(n), to: .you)
+                        if let matcher = self.selfVoiceMatcher {
+                            if case .local(let n) = speaker {
+                                if await matcher.isSelf(localSpeakerNumber: n) {
+                                    speaker = .you
+                                } else if case .isSelf = await matcher.classifyUtterance(
+                                    localSpeakerNumber: n,
+                                    startTime: segment.startTime,
+                                    endTime: segment.endTime
+                                ) {
+                                    // Just identified as the user — catch earlier
+                                    // bubbles up too.
+                                    speaker = .you
+                                    store.relabel(from: .local(n), to: .you)
+                                }
+                            } else if speaker == .you,
+                                      let index = await dm.dominantIndex(
+                                        from: segment.startTime, to: segment.endTime
+                                      ) {
+                                // Single-voice collapse assumed the lone mic voice
+                                // is the user. Verify against the voiceprint: a
+                                // guest talking near the Mac while the user is
+                                // quiet must not be transcribed as "You".
+                                let n = index + 1
+                                if await matcher.isNotSelf(localSpeakerNumber: n) {
+                                    speaker = .local(n)
+                                } else if case .notSelf = await matcher.classifyUtterance(
+                                    localSpeakerNumber: n,
+                                    startTime: segment.startTime,
+                                    endTime: segment.endTime
+                                ) {
+                                    speaker = .local(n)
+                                    store.relabel(from: .you, to: .local(n))
+                                }
                             }
                         }
                     }

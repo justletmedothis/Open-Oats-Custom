@@ -68,6 +68,12 @@ final class TranscriptStore {
         }
     }
 
+    /// Rewrites the speaker on a single utterance (live manual correction).
+    func updateSpeaker(utteranceID: UUID, to newSpeaker: Speaker) {
+        guard let index = utterances.firstIndex(where: { $0.id == utteranceID }) else { return }
+        utterances[index] = utterances[index].withSpeaker(newSpeaker)
+    }
+
     @discardableResult
     func append(_ utterance: Utterance) -> Bool {
         guard !shouldSuppressAcousticEcho(utterance) else { return false }

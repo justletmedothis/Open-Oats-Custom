@@ -2218,7 +2218,7 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
         Button {
             insertAttachmentFromFile(controller: controller)
         } label: {
-            Label("Add Attachment", systemImage: "paperclip.badge.plus")
+            Label("Add Attachment", systemImage: "paperclip")
                 .font(.system(size: 12))
         }
         .buttonStyle(.bordered)

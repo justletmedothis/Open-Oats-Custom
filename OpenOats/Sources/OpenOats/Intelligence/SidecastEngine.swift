@@ -45,7 +45,11 @@ final class SidecastEngine {
     private var pendingUtterance: Utterance?
     private var cooldownRetryTask: Task<Void, Never>?
 
-    private static let liveGenerationTimeout: TimeInterval = 20
+    /// Idle timeout between streamed bytes. Free-tier models routinely queue
+    /// the first token for 20s+ under load; a tighter budget makes them fail
+    /// (and retry, and fail) instead of ever answering, which reads as
+    /// "thinking forever" in the panel.
+    private static let liveGenerationTimeout: TimeInterval = 45
 
     init(transcriptStore: TranscriptStore, knowledgeBase: KnowledgeBase, settings: AppSettings) {
         self.transcriptStore = transcriptStore
@@ -171,7 +175,8 @@ final class SidecastEngine {
             baseURL: llmBaseURL,
             webSearch: shouldUseWebSearch(for: personas),
             transport: settings.activeLLMTransport,
-            requestTimeout: Self.liveGenerationTimeout
+            requestTimeout: Self.liveGenerationTimeout,
+            disableReasoning: true
         )
 
         var fullResponse = ""

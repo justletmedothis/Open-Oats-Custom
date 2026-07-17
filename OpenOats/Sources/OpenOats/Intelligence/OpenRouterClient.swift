@@ -99,6 +99,15 @@ actor OpenRouterClient {
         let max_completion_tokens: Int?
         let temperature: Double?
         let plugins: [WebSearchPlugin]?
+        var reasoning: ReasoningOptions? = nil
+    }
+
+    /// OpenRouter's unified reasoning-token control. `enabled: false` asks
+    /// reasoning-capable models to skip thinking tokens entirely, which is the
+    /// difference between sub-second and 30s+ first output for latency-critical
+    /// callers. Models without toggleable reasoning ignore it.
+    struct ReasoningOptions: Codable {
+        let enabled: Bool
     }
 
     /// Whether a URL points to a host that supports the `max_completion_tokens`
@@ -131,7 +140,8 @@ actor OpenRouterClient {
         baseURL: URL? = nil,
         webSearch: Bool = false,
         transport: CompletionTransport = .chatCompletions,
-        requestTimeout: TimeInterval = 300
+        requestTimeout: TimeInterval = 300,
+        disableReasoning: Bool = false
     ) -> AsyncThrowingStream<String, Error> {
         if transport == .anthropicMessages {
             return streamAnthropicCompletion(
@@ -161,7 +171,10 @@ actor OpenRouterClient {
                         max_tokens: useNewParam ? nil : maxTokens,
                         max_completion_tokens: useNewParam ? maxTokens : nil,
                         temperature: temperature,
-                        plugins: webSearch ? [.default] : nil
+                        plugins: webSearch ? [.default] : nil,
+                        // Only OpenRouter understands the unified reasoning knob.
+                        reasoning: (disableReasoning && targetURL.host?.contains("openrouter.ai") == true)
+                            ? ReasoningOptions(enabled: false) : nil
                     )
 
                     var urlRequest = URLRequest(url: targetURL)

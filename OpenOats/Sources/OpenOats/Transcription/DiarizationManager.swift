@@ -131,6 +131,29 @@ actor DiarizationManager {
         return channel.speaker(forDiarizerIndex: bestSpeaker)
     }
 
+    /// Raw diarizer index with the most speech overlapping the range, without
+    /// the single-speaker collapse or hysteresis. Used to verify the collapsed
+    /// "one voice = the user" assumption against the enrolled voiceprint.
+    func dominantIndex(from startTime: TimeInterval, to endTime: TimeInterval) -> Int? {
+        let queryStart = Float(startTime)
+        let queryEnd = Float(endTime)
+        var best: (index: Int, overlap: Float)?
+        for (index, speaker) in diarizer.timeline.speakers {
+            var overlap: Float = 0
+            for segment in speaker.finalizedSegments + speaker.tentativeSegments {
+                let overlapStart = max(segment.startTime, queryStart)
+                let overlapEnd = min(segment.endTime, queryEnd)
+                if overlapEnd > overlapStart {
+                    overlap += overlapEnd - overlapStart
+                }
+            }
+            if overlap > 0, overlap > (best?.overlap ?? 0) {
+                best = (index, overlap)
+            }
+        }
+        return best?.index
+    }
+
     /// Returns diarized speaker runs overlapping the given range.
     /// These runs can be used to split a longer speech segment into
     /// smaller speaker-consistent chunks.

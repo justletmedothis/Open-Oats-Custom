@@ -807,6 +807,16 @@ actor BatchAudioTranscriber {
             return
         }
 
+        // Names assigned to lettered speakers during the live session are keyed
+        // by live letters that re-diarization is about to invalidate. Map them
+        // onto the new letters by time overlap before the save prunes them.
+        let liveAssignedNames = await sessionRepository.loadSession(id: sessionID).index.speakerNames ?? [:]
+        let reconciledNames = Self.reconcileLiveSpeakerNames(
+            liveNames: liveAssignedNames,
+            liveRecords: existingRecords,
+            finalRecords: allRecords
+        )
+
         // Atomic write of final transcript + full markdown regeneration via mirroring
         await sessionRepository.saveFinalTranscript(
             sessionID: sessionID,
@@ -814,6 +824,13 @@ actor BatchAudioTranscriber {
             backupCurrentTranscript: true,
             markAsRecoveredIfIssuePresent: true
         )
+
+        // User-assigned live names take precedence over library auto-names:
+        // merge them first (merge never overwrites existing keys).
+        if !reconciledNames.isEmpty {
+            Log.batchTranscription.info("Carried \(reconciledNames.count, privacy: .public) live speaker name(s) across re-diarization")
+            await sessionRepository.mergeSessionSpeakerNames(sessionID: sessionID, adding: reconciledNames)
+        }
         // Retain batch stems/metadata for a bounded rerun/debug window.
         // SessionRepository purges expired retained assets on startup.
 
@@ -970,14 +987,17 @@ actor BatchAudioTranscriber {
                     let text = try await backend.transcribe(sliceSamples, locale: locale, previousContext: nil)
                     guard !text.isEmpty else { continue }
 
-                    let timestamp = resolvedStartDate.addingTimeInterval(
-                        segmentStartTime + (Double(slice.startSample) / 16_000.0)
-                    )
+                    let sliceStart = segmentStartTime + (Double(slice.startSample) / 16_000.0)
+                    let sliceEnd = sliceStart + (Double(rangeEnd - slice.startSample) / 16_000.0)
+                    let timestamp = resolvedStartDate.addingTimeInterval(sliceStart)
 
                     records.append(SessionRecord(
                         speaker: slice.speaker,
                         text: text,
-                        timestamp: timestamp
+                        timestamp: timestamp,
+                        startTime: sliceStart,
+                        endTime: sliceEnd,
+                        source: speaker.isRemote ? .system : .microphone
                     ))
                 }
             }
@@ -1060,6 +1080,57 @@ actor BatchAudioTranscriber {
             guard let mapped = mapping[record.speaker] else { return record }
             return record.withSpeaker(mapped)
         }
+    }
+
+    /// Maps live-assigned lettered-speaker names onto the re-diarized speakers
+    /// by time overlap. Live letters (local_*/remote_*) are invalidated by the
+    /// batch pass, but the voice that spoke during the named live speaker's
+    /// utterances is the same voice regardless of lettering, so the
+    /// dominant-overlap new speaker inherits the name. you/them keys survive
+    /// the prune on their own and are not touched here.
+    static func reconcileLiveSpeakerNames(
+        liveNames: [String: String],
+        liveRecords: [SessionRecord],
+        finalRecords: [SessionRecord]
+    ) -> [String: String] {
+        let letteredNames = liveNames
+            .filter { $0.key.hasPrefix("local_") || $0.key.hasPrefix("remote_") }
+            .sorted { $0.key < $1.key }
+        guard !letteredNames.isEmpty else { return [:] }
+
+        var result: [String: String] = [:]
+        for (liveKey, name) in letteredNames {
+            let ranges: [(start: Double, end: Double)] = liveRecords.compactMap { record in
+                guard record.speaker.storageKey == liveKey,
+                      let start = record.startTime, let end = record.endTime, end > start
+                else { return nil }
+                return (start, end)
+            }
+            guard !ranges.isEmpty else { continue }
+
+            // Mic and system timelines are only aligned within their own
+            // channel; never match a mic voice against system records.
+            let liveKeyIsMic = liveKey.hasPrefix("local_")
+            var overlapByKey: [String: Double] = [:]
+            for record in finalRecords {
+                guard !record.speaker.isRemote == liveKeyIsMic,
+                      let start = record.startTime, let end = record.endTime, end > start
+                else { continue }
+                let overlap = ranges.reduce(0.0) {
+                    $0 + max(0, min(end, $1.end) - max(start, $1.start))
+                }
+                if overlap > 0 {
+                    overlapByKey[record.speaker.storageKey, default: 0] += overlap
+                }
+            }
+
+            guard let best = overlapByKey.max(by: { $0.value < $1.value }),
+                  best.key != Speaker.you.storageKey,
+                  result[best.key] == nil
+            else { continue }
+            result[best.key] = name
+        }
+        return result
     }
 
     /// Reassigns records of diarized mic voices that spoke less than

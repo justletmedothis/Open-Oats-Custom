@@ -69,6 +69,9 @@ final class LiveSessionState {
     var recordingHealthNotice: RecordingHealthNotice? = nil
     /// The user's live scratchpad text for the active session.
     var scratchpadText: String = ""
+    /// Names the user has assigned to live speakers this session
+    /// (storageKey → name). Persisted to the session as they're set.
+    var liveSpeakerNames: [String: String] = [:]
 }
 
 /// Owns all live session side effects: polling, utterance ingestion,
@@ -736,6 +739,7 @@ final class LiveSessionController {
         let initialScratchpad = pendingInitialScratchpad?.trimmingCharacters(in: .whitespacesAndNewlines)
         pendingInitialScratchpad = nil
         state.scratchpadText = initialScratchpad ?? ""
+        state.liveSpeakerNames = [:]
         if let initialScratchpad, !initialScratchpad.isEmpty {
             await coordinator.sessionRepository.saveScratchpad(sessionID: handle.sessionID, text: initialScratchpad)
         }
@@ -1681,6 +1685,43 @@ final class LiveSessionController {
         }
         if state.suggestions != sidebarSuggestions {
             state.suggestions = sidebarSuggestions
+        }
+    }
+
+    // MARK: - Live Speaker Corrections
+
+    /// Assigns a name to a live speaker (empty name clears it). Persists to the
+    /// session immediately so notes generation and the batch pass see it.
+    func renameLiveSpeaker(_ speaker: Speaker, to name: String) {
+        guard let sessionID = _currentSessionID else { return }
+        var names = state.liveSpeakerNames
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty || trimmed == speaker.displayLabel {
+            names.removeValue(forKey: speaker.storageKey)
+        } else {
+            names[speaker.storageKey] = trimmed
+        }
+        state.liveSpeakerNames = names
+        Task {
+            await coordinator.sessionRepository.updateSessionSpeakerNames(
+                sessionID: sessionID, speakerNames: names
+            )
+        }
+    }
+
+    /// Live "Not me" on a You-labeled mic line: tells the voiceprint matcher
+    /// that voice is someone else (future lines letter automatically) and moves
+    /// this line off "You". Bulk cleanup of earlier lines is left to the batch
+    /// pass, which re-attributes everything anyway.
+    func markLiveUtteranceNotMe(_ utterance: Utterance) {
+        guard utterance.speaker == .you,
+              let start = utterance.startTime, let end = utterance.endTime else { return }
+        Task {
+            guard let engine = coordinator.transcriptionEngine else { return }
+            let letter = await engine.markMicVoiceNotSelf(startTime: start, endTime: end)
+            coordinator.transcriptStore.updateSpeaker(
+                utteranceID: utterance.id, to: letter ?? .local(1)
+            )
         }
     }
 
