@@ -113,7 +113,19 @@ final class AppleSpeechLiveTranscriber: LiveTranscribing, @unchecked Sendable {
 
         inputBuilder.finish()
         onPartial("")
-        try? await analyzer.finalizeAndFinishThroughEndOfInput()
+        if Task.isCancelled {
+            // The session is stopping. finalizeAndFinishThroughEndOfInput drains
+            // every buffered sample through the model before returning, which on
+            // a memory-constrained machine (two live analyzers + Sidecast) can
+            // trail the audio by many seconds and stall the Stop button for that
+            // whole backlog. The batch pass re-transcribes the session and
+            // overwrites the live transcript anyway, so drop the backlog and
+            // finish immediately instead.
+            await analyzer.cancelAndFinishNow()
+        } else {
+            // Natural stream end (device loss, restart): keep the tail.
+            try? await analyzer.finalizeAndFinishThroughEndOfInput()
+        }
         await resultsTask.value
     }
 

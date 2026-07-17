@@ -796,11 +796,13 @@ final class TranscriptionEngine {
         pendingSystemAudioRestart = false
         micKeepAliveTask?.cancel()
 
-        micCapture.finishStream()
-        systemCapture.finishStream()
-
+        // Cancel BEFORE finishing the streams so the transcriber loops observe
+        // cancellation by the time they reach their finish branch and take the
+        // fast, no-drain path (see AppleSpeechLiveTranscriber.runAnalyzer).
         micTask?.cancel()
         sysTask?.cancel()
+        micCapture.finishStream()
+        systemCapture.finishStream()
         await micTask?.value
         await sysTask?.value
 
