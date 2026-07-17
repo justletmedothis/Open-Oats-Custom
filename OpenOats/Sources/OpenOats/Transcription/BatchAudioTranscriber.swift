@@ -309,7 +309,8 @@ actor BatchAudioTranscriber {
         notesDirectory: URL,
         enableDiarization: Bool = false,
         enableMicDiarization: Bool = false,
-        diarizationVariant: DiarizationVariant = .dihard3
+        diarizationVariant: DiarizationVariant = .dihard3,
+        expectedInRoomSpeakers: Int? = nil
     ) async {
         // Cancel any existing task
         currentTask?.cancel()
@@ -327,7 +328,8 @@ actor BatchAudioTranscriber {
                     notesDirectory: notesDirectory,
                     enableDiarization: enableDiarization,
                     enableMicDiarization: enableMicDiarization,
-                    diarizationVariant: diarizationVariant
+                    diarizationVariant: diarizationVariant,
+                    expectedInRoomSpeakers: expectedInRoomSpeakers
                 )
             } catch is CancellationError {
                 await self.setStatus(.cancelled)
@@ -507,7 +509,8 @@ actor BatchAudioTranscriber {
         notesDirectory: URL,
         enableDiarization: Bool,
         enableMicDiarization: Bool,
-        diarizationVariant: DiarizationVariant
+        diarizationVariant: DiarizationVariant,
+        expectedInRoomSpeakers: Int? = nil
     ) async throws {
         Log.batchTranscription.info("Starting batch transcription for \(sessionID, privacy: .public) with \(model.rawValue, privacy: .public)")
         DiagnosticsSupport.record(category: "batch", message: "Starting batch transcription for \(sessionID) model=\(model.rawValue)")
@@ -574,10 +577,11 @@ actor BatchAudioTranscriber {
         func diarizeWholeFile(
             _ samples: [Float],
             with dm: DiarizationManager,
-            channelName: StaticString
+            channelName: StaticString,
+            maxSpeakers: Int? = nil
         ) async throws -> Bool {
             do {
-                try await dm.processOffline(samples)
+                try await dm.processOffline(samples, maxSpeakers: maxSpeakers)
                 return true
             } catch is CancellationError {
                 throw CancellationError()
@@ -617,7 +621,7 @@ actor BatchAudioTranscriber {
                     targetRate: 16000,
                     overrideSampleRate: anchors?.micSampleRate
                 )
-                if try await diarizeWholeFile(samples, with: dm, channelName: "microphone") {
+                if try await diarizeWholeFile(samples, with: dm, channelName: "microphone", maxSpeakers: expectedInRoomSpeakers) {
                     micDiarizer = dm
                     let segments = await dm.speakerSegments()
                     micSpeakerSegments = segments

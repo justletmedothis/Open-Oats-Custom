@@ -860,10 +860,21 @@ final class NotesController {
         state.showingOriginal.toggle()
     }
 
-    func rerunBatchTranscription(model: TranscriptionModel, settings: AppSettings) {
+    /// - Parameter speakerCountOverride: When non-nil, re-diarizes with this
+    ///   exact in-room speaker cap instead of the sticky setting (the
+    ///   "re-diarize with N speakers" correction on a finished meeting). 0 means
+    ///   Auto (no cap).
+    func rerunBatchTranscription(
+        model: TranscriptionModel,
+        settings: AppSettings,
+        speakerCountOverride: Int? = nil
+    ) {
         guard let sessionID = state.selectedSessionID,
               state.canRetranscribeSelectedSession,
               let batchAudioTranscriber = coordinator.batchAudioTranscriber else { return }
+
+        let requestedSpeakers = speakerCountOverride ?? settings.expectedInRoomSpeakers
+        let expectedInRoomSpeakers = requestedSpeakers > 0 ? requestedSpeakers : nil
 
         let notesDirectory = URL(fileURLWithPath: settings.notesFolderPath)
         Task {
@@ -875,7 +886,8 @@ final class NotesController {
                 notesDirectory: notesDirectory,
                 enableDiarization: settings.enableDiarization,
                 enableMicDiarization: settings.enableMicDiarization,
-                diarizationVariant: settings.diarizationVariant
+                diarizationVariant: settings.diarizationVariant,
+                expectedInRoomSpeakers: expectedInRoomSpeakers
             )
             pendingAutoNotes = (sessionID: sessionID, settings: settings)
             await reloadSessionAfterTranscriptMutation(sessionID: sessionID)

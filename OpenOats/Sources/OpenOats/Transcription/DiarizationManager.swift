@@ -69,9 +69,9 @@ actor DiarizationManager {
     /// sticky-speaker hysteresis on borderline overlap calls.
     private var lastDominantIndex: Int?
 
-    /// Lazily created offline VBx pipeline, kept loaded so mic and system
-    /// channels processed back to back reuse the same CoreML models.
-    private nonisolated(unsafe) var offlineManager: OfflineDiarizerManager?
+    /// Offline VBx models, loaded once and shared across channels (and across
+    /// capped/uncapped managers) so mic and system don't each reload CoreML.
+    private nonisolated(unsafe) var offlineModels: OfflineDiarizerModels?
 
     /// Whether the streaming LS-EEND model has been loaded via load(variant:).
     var isStreamingModelLoaded: Bool { isInitialized }
@@ -89,20 +89,28 @@ actor DiarizationManager {
     /// Offline reclustering of the whole file is substantially more accurate
     /// than the streaming timeline (~11% vs ~30% DER on meeting benchmarks).
     /// Downloads the offline models on first use.
-    func processOffline(_ samples: [Float]) async throws {
-        if offlineManager == nil {
-            offlineManager = OfflineDiarizerManager()
-            do {
-                try await offlineManager?.prepareModels()
-            } catch {
-                // Leave no half-initialized manager behind for the next attempt.
-                offlineManager = nil
-                throw error
-            }
+    /// - Parameter maxSpeakers: Soft cap on how many speakers the clustering may
+    ///   find (an "expected in-room speakers" hint for the mic channel, counting
+    ///   the user). nil lets the pipeline discover the count from the clustering
+    ///   threshold alone. A cap only bounds the maximum; a quieter room still
+    ///   yields fewer speakers.
+    func processOffline(_ samples: [Float], maxSpeakers: Int? = nil) async throws {
+        if offlineModels == nil {
+            // Loads from the cached repo, downloading on first use.
+            offlineModels = try await OfflineDiarizerModels.load()
         }
-        let processed: DiarizationResult?
+        guard let offlineModels else { return }
+
+        var config = OfflineDiarizerConfig.default
+        if let maxSpeakers, maxSpeakers > 0 {
+            config.clustering.maxSpeakers = maxSpeakers
+        }
+        let manager = OfflineDiarizerManager(config: config)
+        manager.initialize(models: offlineModels)
+
+        let result: DiarizationResult
         do {
-            processed = try await offlineManager?.process(audio: samples)
+            result = try await manager.process(audio: samples)
         } catch OfflineDiarizationError.noSpeechDetected {
             // A silent channel (e.g. no call audio during an in-person
             // meeting) is a valid empty result, not an engine failure: record
@@ -112,7 +120,6 @@ actor DiarizationManager {
             Log.diarization.info("Offline VBx diarization: no speech detected on this channel")
             return
         }
-        guard let result = processed else { return }
 
         // Map speaker ids to integer indices in order of first appearance so
         // downstream lettering (Speaker A, B, ...) follows speaking order.

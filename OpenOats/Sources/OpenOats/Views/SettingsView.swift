@@ -622,6 +622,7 @@ private struct TranscriptionSettingsTab: View {
 
                     if settings.enableMicDiarization {
                         voiceProfileRow
+                        expectedSpeakersRow
                     }
 
                     if settings.enableDiarization || settings.enableMicDiarization {
@@ -720,39 +721,123 @@ private struct TranscriptionSettingsTab: View {
         )
     }
 
+    /// Sticky "expected in-room speakers" hint. Soft-caps the batch mic
+    /// diarizer so it stops over-splitting one voice into several. Counts you.
+    @ViewBuilder
+    private var expectedSpeakersRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Stepper(value: $settings.expectedInRoomSpeakers, in: 0...12) {
+                HStack {
+                    Text("Expected in-room speakers")
+                        .font(.system(size: 12))
+                    Spacer()
+                    Text(settings.expectedInRoomSpeakers == 0 ? "Auto" : "\(settings.expectedInRoomSpeakers)")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text("Including you. Caps how many different in-person voices the batch pass separates, so it stops splitting one person into several. Leave on Auto to detect the count. Remote callers on a call are counted separately. You can also re-diarize a finished meeting with an exact count from its transcript.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+    }
+
     /// The persistent named-voice library: people remembered via "Remember
     /// this voice" in the transcript's rename popover.
     @ViewBuilder
     private var savedVoicesRows: some View {
         VStack(alignment: .leading, spacing: 6) {
+            Text("Saved voices")
+                .font(.system(size: 12, weight: .medium))
+
+            // Your own enrolled voice, so the roster is complete. Managed by the
+            // "My voice" controls above (record / re-record / remove).
+            if let selfProfile = voiceEnrollment.profile {
+                HStack {
+                    Text("You")
+                        .font(.system(size: 12))
+                    Text("your voice" + (selfProfile.sampleCount.map { " · \($0) sample\($0 == 1 ? "" : "s")" } ?? ""))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                    Text("Managed above")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            ForEach(savedVoices) { profile in
+                SavedVoiceRow(
+                    profile: profile,
+                    onRename: { newName in
+                        SpeakerLibraryStore.rename(id: profile.id, to: newName)
+                        savedVoices = SpeakerLibraryStore.load()
+                    },
+                    onForget: {
+                        SpeakerLibraryStore.delete(id: profile.id)
+                        savedVoices = SpeakerLibraryStore.load()
+                    }
+                )
+            }
+
             if savedVoices.isEmpty {
-                Text("Saved voices: none yet. Rename a lettered speaker in a transcript and turn on \"Remember this voice\" to auto-name them in future meetings.")
+                Text("No named guests yet. Rename a lettered speaker in a transcript and turn on \"Remember this voice\" to auto-name them in future meetings.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } else {
-                Text("Saved voices")
-                    .font(.system(size: 12, weight: .medium))
-                ForEach(savedVoices) { profile in
-                    HStack {
-                        Text(profile.name)
-                            .font(.system(size: 12))
-                        Text("\(profile.sampleCount) sample\(profile.sampleCount == 1 ? "" : "s") · updated \(profile.updatedAt.formatted(date: .abbreviated, time: .omitted))")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.tertiary)
-                        Spacer()
-                        Button("Forget") {
-                            SpeakerLibraryStore.delete(id: profile.id)
-                            savedVoices = SpeakerLibraryStore.load()
-                        }
-                        .font(.system(size: 12))
-                    }
-                }
                 Text("Voices recognized in future meetings are auto-named. Everything stays on this Mac.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
         }
         .onAppear { savedVoices = SpeakerLibraryStore.load() }
+    }
+
+    /// One library voice with inline rename and Forget.
+    private struct SavedVoiceRow: View {
+        let profile: SpeakerProfile
+        let onRename: (String) -> Void
+        let onForget: () -> Void
+        @State private var editedName = ""
+        @State private var isEditing = false
+
+        var body: some View {
+            HStack {
+                if isEditing {
+                    TextField("Name", text: $editedName)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12))
+                        .frame(maxWidth: 160)
+                        .onSubmit { commit() }
+                    Button("Save") { commit() }
+                        .font(.system(size: 12))
+                    Button("Cancel") { isEditing = false }
+                        .font(.system(size: 12))
+                } else {
+                    Text(profile.name)
+                        .font(.system(size: 12))
+                    Text("\(profile.sampleCount) sample\(profile.sampleCount == 1 ? "" : "s") · updated \(profile.updatedAt.formatted(date: .abbreviated, time: .omitted))")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                    Button("Rename") {
+                        editedName = profile.name
+                        isEditing = true
+                    }
+                    .font(.system(size: 12))
+                    Button("Forget") { onForget() }
+                        .font(.system(size: 12))
+                }
+            }
+        }
+
+        private func commit() {
+            let trimmed = editedName.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty, trimmed != profile.name {
+                onRename(trimmed)
+            }
+            isEditing = false
+        }
     }
 
     @ViewBuilder

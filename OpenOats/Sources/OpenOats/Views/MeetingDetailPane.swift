@@ -2011,6 +2011,31 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
                     systemImage: settings.enableDiarization || settings.enableMicDiarization ? "person.2" : "person.2.slash"
                 )
                 .foregroundStyle(.secondary)
+
+                // Re-diarize with a known in-room headcount when Auto split you
+                // (or a guest) into too many/few speakers. Re-runs the batch pass
+                // with the cap; counts you.
+                if settings.enableMicDiarization {
+                    Menu("Re-diarize with…") {
+                        Button {
+                            container.ensureRecordingServicesInitialized(settings: settings, coordinator: coordinator)
+                            controller.rerunBatchTranscription(model: settings.batchTranscriptionModel, settings: settings, speakerCountOverride: 0)
+                        } label: {
+                            Label("Auto (detect count)", systemImage: "sparkles")
+                        }
+                        .disabled(isBatchBusy)
+                        ForEach(2...8, id: \.self) { count in
+                            Button {
+                                container.ensureRecordingServicesInitialized(settings: settings, coordinator: coordinator)
+                                controller.rerunBatchTranscription(model: settings.batchTranscriptionModel, settings: settings, speakerCountOverride: count)
+                            } label: {
+                                Label("\(count) people in the room (incl. me)", systemImage: settings.expectedInRoomSpeakers == count ? "checkmark" : "person.2")
+                            }
+                            .disabled(isBatchBusy)
+                        }
+                    }
+                    .disabled(isBatchBusy)
+                }
             }
 
             if state.hasOriginalTranscriptBackup {

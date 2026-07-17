@@ -817,6 +817,22 @@ final class SettingsStore {
         }
     }
 
+    /// Expected number of in-room speakers for the microphone channel,
+    /// including the user. 0 means "Auto" (let diarization discover the count).
+    /// Applied as a soft cap (maxSpeakers) on the batch mic diarizer, so a
+    /// quieter room still yields fewer speakers.
+    @ObservationIgnored nonisolated(unsafe) private var _expectedInRoomSpeakers: Int
+    var expectedInRoomSpeakers: Int {
+        get { access(keyPath: \.expectedInRoomSpeakers); return _expectedInRoomSpeakers }
+        set {
+            let clamped = max(0, min(newValue, 12))
+            withMutation(keyPath: \.expectedInRoomSpeakers) {
+                _expectedInRoomSpeakers = clamped
+                defaults.set(clamped, forKey: "expectedInRoomSpeakers")
+            }
+        }
+    }
+
     @ObservationIgnored nonisolated(unsafe) private var _diarizationVariant: String
     var diarizationVariant: DiarizationVariant {
         get { access(keyPath: \.diarizationVariant); return DiarizationVariant(rawValue: _diarizationVariant) ?? .dihard3 }
@@ -1536,6 +1552,7 @@ final class SettingsStore {
         ) ?? .whisperLargeV3Turbo
         self._enableDiarization = defaults.bool(forKey: "enableDiarization")
         self._enableMicDiarization = defaults.bool(forKey: "enableMicDiarization")
+        self._expectedInRoomSpeakers = max(0, min(defaults.integer(forKey: "expectedInRoomSpeakers"), 12))
         self._diarizationVariant = defaults.string(forKey: "diarizationVariant") ?? DiarizationVariant.dihard3.rawValue
 
         // Detection Settings
