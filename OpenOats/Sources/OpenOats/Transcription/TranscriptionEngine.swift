@@ -239,6 +239,28 @@ final class TranscriptionEngine {
         }
         return .local(n)
     }
+
+    /// Live "This is me" on a lettered mic speaker: pins that diarized voice
+    /// as the user so its lines say "You" from here on, immune to rescoring.
+    func assignMicSpeakerToSelf(localSpeakerNumber n: Int) async {
+        guard let matcher = voiceMatcher else { return }
+        await matcher.markSelf(localSpeakerNumber: n)
+    }
+
+    /// The user assigned a name to a lettered mic speaker: stop live scoring
+    /// of that voice so an auto match (or a self match folding it into "You")
+    /// can't fight the manual assignment.
+    func pinMicSpeakerUserAssigned(localSpeakerNumber n: Int) async {
+        guard let matcher = voiceMatcher else { return }
+        await matcher.markAssignedByUser(localSpeakerNumber: n)
+    }
+
+    /// The user cleared a manual name from a lettered mic speaker: reopen
+    /// live scoring for that voice.
+    func unpinMicSpeakerUserAssigned(localSpeakerNumber n: Int) async {
+        guard let matcher = voiceMatcher else { return }
+        await matcher.unpinUserAssignment(localSpeakerNumber: n)
+    }
     /// Live scoring of lettered mic speakers against the enrolled voiceprint
     /// and the named speaker library.
     private var voiceMatcher: LiveVoiceMatcher?
@@ -525,13 +547,13 @@ final class TranscriptionEngine {
                 self.micDiarizationManager = dm
                 let voiceprint = VoiceprintStore.load()?.embedding
                 let libraryProfiles = SpeakerLibraryStore.load()
-                if voiceprint != nil || !libraryProfiles.isEmpty {
-                    self.voiceMatcher = LiveVoiceMatcher(
-                        voiceprint: voiceprint, profiles: libraryProfiles
-                    )
-                } else {
-                    self.voiceMatcher = nil
-                }
+                // Always created while mic diarization is on: even with no
+                // voiceprint and an empty library it carries the user's
+                // "This is me" / manual-name pins. With nothing to match it
+                // never scores audio (classifyUtterance's canScore guard).
+                self.voiceMatcher = LiveVoiceMatcher(
+                    voiceprint: voiceprint, profiles: libraryProfiles
+                )
                 Log.transcription.info("Mic diarization model loaded")
             } else {
                 self.micDiarizationManager = nil
@@ -581,6 +603,7 @@ final class TranscriptionEngine {
             diarizationManager = nil
             micDiarizationManager = nil
             voiceMatcher = nil
+            onLiveSpeakerAutoNamed = nil
             activeTranscriptionSession = nil
             assetStatus = "Ready"
             isRunning = false
@@ -893,6 +916,7 @@ final class TranscriptionEngine {
         diarizationManager = nil
         micDiarizationManager = nil
         voiceMatcher = nil
+        onLiveSpeakerAutoNamed = nil
         micBackend = nil
         systemBackend = nil
         vadManager = nil
@@ -1010,6 +1034,7 @@ final class TranscriptionEngine {
         diarizationManager = nil
         micDiarizationManager = nil
         voiceMatcher = nil
+        onLiveSpeakerAutoNamed = nil
         isRunning = false
         assetStatus = "Ready"
     }
@@ -1169,36 +1194,47 @@ final class TranscriptionEngine {
                             let rawIndex = await dm.dominantIndex(
                                 from: segment.startTime, to: segment.endTime
                             )
-                            let n: Int
+                            let resolvedIndex: Int?
                             if case .local(let localN) = diarized {
-                                n = localN
+                                resolvedIndex = localN
                             } else if let rawIndex {
-                                n = rawIndex + 1
+                                resolvedIndex = rawIndex + 1
                             } else {
-                                n = 1
+                                // No diarized overlap for this range (diarizer
+                                // lag or a timeline gap). Don't guess cluster 1:
+                                // feeding this window into a guessed cluster's
+                                // clip can wrongly confirm or demote that voice.
+                                resolvedIndex = nil
                             }
 
-                            switch await matcher.classifyUtterance(
-                                localSpeakerNumber: n,
-                                startTime: segment.startTime,
-                                endTime: segment.endTime
-                            ) {
-                            case .isSelf:
-                                // The user's voice, confirmed now or on an
-                                // earlier utterance and re-verified since —
-                                // promote provisional lettered bubbles too.
-                                speaker = .you
-                                store.relabel(from: .local(n), to: .you)
-                            case .matchedLibrary(let name):
-                                // Recognized from the speaker library: keep
-                                // the lettered label and surface the name.
-                                speaker = .local(n)
-                                self.onLiveSpeakerAutoNamed?(Speaker.local(n).storageKey, name)
-                            case .notSelf, .pending:
-                                // Decisively someone else, or not yet scored:
-                                // keep the provisional "Speaker" label rather
-                                // than guessing "You".
-                                speaker = .local(n)
+                            if let n = resolvedIndex {
+                                let verdict = await matcher.classifyUtterance(
+                                    localSpeakerNumber: n,
+                                    startTime: segment.startTime,
+                                    endTime: segment.endTime
+                                )
+                                // Re-check after the awaits: a stale task from
+                                // a stopped session must not publish names or
+                                // bubbles into the session that replaced it.
+                                guard self.liveEpoch == epoch else { return }
+                                switch verdict {
+                                case .isSelf:
+                                    // The user's voice, confirmed now or on an
+                                    // earlier utterance and re-verified since —
+                                    // promote provisional lettered bubbles too.
+                                    speaker = .you
+                                    store.relabel(from: .local(n), to: .you)
+                                case .matchedLibrary(let name):
+                                    // Recognized from the speaker library: keep
+                                    // the lettered label and surface the name.
+                                    speaker = .local(n)
+                                    self.onLiveSpeakerAutoNamed?(Speaker.local(n).storageKey, name)
+                                case .notSelf, .pending:
+                                    // Decisively someone else, or not yet scored:
+                                    // keep the provisional "Speaker" label rather
+                                    // than guessing "You".
+                                    speaker = .local(n)
+                                }
                             }
                         } else {
                             // No voiceprint enrolled: fall back to the "mic = you"
@@ -1207,19 +1243,31 @@ final class TranscriptionEngine {
                             // so people from earlier meetings get their names live.
                             speaker = diarized
                             if case .local(let n) = diarized, let matcher = self.voiceMatcher {
-                                switch await matcher.classifyUtterance(
+                                let verdict = await matcher.classifyUtterance(
                                     localSpeakerNumber: n,
                                     startTime: segment.startTime,
                                     endTime: segment.endTime
-                                ) {
+                                )
+                                guard self.liveEpoch == epoch else { return }
+                                switch verdict {
                                 case .matchedLibrary(let name):
                                     self.onLiveSpeakerAutoNamed?(Speaker.local(n).storageKey, name)
-                                case .isSelf, .notSelf, .pending:
+                                case .isSelf:
+                                    // Only reachable via a user's "This is me"
+                                    // pin (no voiceprint to match otherwise) —
+                                    // honor it or the letter resurrects on the
+                                    // next utterance.
+                                    speaker = .you
+                                    store.relabel(from: .local(n), to: .you)
+                                case .notSelf, .pending:
                                     break
                                 }
                             }
                         }
                     }
+                    // Awaits above can outlive the session; never append a
+                    // dead session's utterance into its replacement.
+                    guard self.liveEpoch == epoch else { return }
                     store.append(
                         Utterance(
                             text: segment.text,
@@ -1307,6 +1355,9 @@ final class TranscriptionEngine {
                     } else {
                         speaker = .them
                     }
+                    // Re-check after the await: a stale task from a stopped
+                    // session must not append into its replacement.
+                    guard self.liveEpoch == epoch else { return }
                     store.append(
                         Utterance(
                             text: segment.text,

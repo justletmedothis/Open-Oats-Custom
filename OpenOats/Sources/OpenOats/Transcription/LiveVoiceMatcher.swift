@@ -44,6 +44,10 @@ actor LiveVoiceMatcher {
     private var decided: Set<Int> = []
     private var selfIndices: Set<Int> = []
     private var matchedNames: [Int: String] = [:]
+    /// Speakers the user explicitly claimed or named ("This is me" / a manual
+    /// name). Scoring and drift verification leave these alone: user intent
+    /// always beats the matcher.
+    private var userPinned: Set<Int> = []
     /// Clip length a speaker must reach before the next scoring attempt, set
     /// when an attempt finds too little clean speech in the clip.
     private var minNextScoreSeconds: [Int: Double] = [:]
@@ -57,8 +61,12 @@ actor LiveVoiceMatcher {
     /// Feed the same 16 kHz mono stream the diarizer receives.
     func appendAudio(_ samples: [Float]) {
         rollingSamples.append(contentsOf: samples)
+        // Trim in ~30 s hunks, not per append: removeFirst memmoves the whole
+        // remaining buffer (~11.5 MB), and mic taps arrive ~12x per second —
+        // per-append trimming would copy ~130 MB/s for the rest of the meeting.
         let capacity = Int(Self.rollingCapacitySeconds * Self.sampleRate)
-        if rollingSamples.count > capacity {
+        let trimHunk = Int(30.0 * Self.sampleRate)
+        if rollingSamples.count > capacity + trimHunk {
             let drop = rollingSamples.count - capacity
             rollingSamples.removeFirst(drop)
             rollingStart += drop
@@ -82,6 +90,42 @@ actor LiveVoiceMatcher {
         decided.insert(n)
         selfIndices.remove(n)
         clips[n] = nil
+        userPinned.insert(n)
+    }
+
+    /// Force-mark a speaker as the user (live "This is me" correction).
+    /// Pinned so drift verification never demotes a user-confirmed self.
+    func markSelf(localSpeakerNumber n: Int) {
+        decided.insert(n)
+        selfIndices.insert(n)
+        matchedNames[n] = nil
+        clips[n] = nil
+        userPinned.insert(n)
+    }
+
+    /// The user assigned a name to this lettered speaker: stop scoring the
+    /// voice and drop any auto match so nothing fights the manual assignment
+    /// (in particular, a later self match must not fold it into "You").
+    func markAssignedByUser(localSpeakerNumber n: Int) {
+        decided.insert(n)
+        selfIndices.remove(n)
+        matchedNames[n] = nil
+        clips[n] = nil
+        userPinned.insert(n)
+    }
+
+    /// The user cleared their assignment: reopen scoring from scratch so the
+    /// voice can still be self-matched or library-named. Only reverses user
+    /// pins — verdicts the matcher earned on its own stay decided.
+    func unpinUserAssignment(localSpeakerNumber n: Int) {
+        guard userPinned.contains(n) else { return }
+        userPinned.remove(n)
+        decided.remove(n)
+        selfIndices.remove(n)
+        matchedNames[n] = nil
+        scoredOnce.remove(n)
+        clips[n] = nil
+        minNextScoreSeconds[n] = nil
     }
 
     /// Record a finalized utterance attributed to a diarized speaker and score
@@ -91,6 +135,11 @@ actor LiveVoiceMatcher {
     func classifyUtterance(
         localSpeakerNumber n: Int, startTime: TimeInterval, endTime: TimeInterval
     ) async -> Verdict {
+        // Nothing to score against and no user pin to honor: skip the clip
+        // bookkeeping entirely (the matcher may exist purely to carry pins).
+        guard hasVoiceprint || !profiles.isEmpty || decided.contains(n) else {
+            return .pending
+        }
         guard !decided.contains(n) else {
             if selfIndices.contains(n) {
                 return await verifySelf(n, startTime: startTime, endTime: endTime)
@@ -157,6 +206,7 @@ actor LiveVoiceMatcher {
     private func verifySelf(
         _ n: Int, startTime: TimeInterval, endTime: TimeInterval
     ) async -> Verdict {
+        guard !userPinned.contains(n) else { return .isSelf }
         appendClip(for: n, startTime: startTime, endTime: endTime)
         let clipSeconds = Double(clips[n]?.count ?? 0) / Self.sampleRate
         guard clipSeconds >= Self.selfVerifySeconds, let clip = clips[n] else { return .isSelf }

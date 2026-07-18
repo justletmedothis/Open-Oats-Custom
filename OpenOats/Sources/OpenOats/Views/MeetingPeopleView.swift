@@ -95,10 +95,13 @@ struct MeetingPeopleView: View {
     }
 
     private var nameSuggestions: [String] {
+        // Exclude only names the USER assigned: a wrong auto-guess must stay
+        // offerable so it can be corrected onto the right speaker (assigning
+        // it overrides the guess everywhere).
         Self.nameSuggestions(
             invitees: state.matchedCalendarEvent?.participants.compactMap(\.displayName) ?? [],
             savedVoices: library.map(\.name),
-            assignedNames: Array(state.displaySpeakerNames.values)
+            assignedNames: Array(state.liveSpeakerNames.values)
         )
     }
 
@@ -167,11 +170,15 @@ struct MeetingPeopleView: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(speakers, id: \.storageKey) { speaker in
+                    let isLettered: Bool = if case .local = speaker { true } else { false }
                     LiveSpeakerNameRow(
                         speaker: speaker,
                         userName: state.liveSpeakerNames[speaker.storageKey],
                         autoName: state.liveAutoSpeakerNames[speaker.storageKey],
                         suggestions: speaker == .you ? [] : nameSuggestions,
+                        onAssignToMe: isLettered ? {
+                            controller?.assignLiveSpeakerToMe(speaker)
+                        } : nil,
                         onCommit: { name in
                             controller?.renameLiveSpeaker(speaker, to: name)
                         }
@@ -239,30 +246,22 @@ struct MeetingPeopleView: View {
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(library) { profile in
-                    HStack(spacing: 6) {
-                        Image(systemName: "person.crop.circle")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                        Text(profile.name)
-                            .font(.system(size: 12))
-                        Text("\(profile.sampleCount) sample\(profile.sampleCount == 1 ? "" : "s")")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.tertiary)
-                        Spacer()
-                        if state.isRunning, isInMeeting(profile.name) {
-                            HStack(spacing: 3) {
-                                Image(systemName: "waveform")
-                                    .font(.system(size: 9))
-                                Text("here")
-                                    .font(.system(size: 10, weight: .medium))
-                            }
-                            .foregroundStyle(Color.accentColor)
+                    LibraryVoiceRow(
+                        profile: profile,
+                        isHere: state.isRunning && isInMeeting(profile.name),
+                        onRename: { newName in
+                            SpeakerLibraryStore.rename(id: profile.id, to: newName)
+                            library = SpeakerLibraryStore.load()
+                        },
+                        onForget: {
+                            SpeakerLibraryStore.delete(id: profile.id)
+                            library = SpeakerLibraryStore.load()
                         }
-                    }
+                    )
                 }
             }
 
-            Text("Manage saved voices in Settings > Transcription > People.")
+            Text("Voices stay on this Mac. Also in Settings > Transcription > People.")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
         }
@@ -275,6 +274,92 @@ struct MeetingPeopleView: View {
     }
 }
 
+/// One saved-voice row in the manageable library index: name with sample
+/// count, a "here" badge when that voice is in the current meeting, and
+/// rename / forget controls (same actions as Settings > People).
+private struct LibraryVoiceRow: View {
+    let profile: SpeakerProfile
+    let isHere: Bool
+    let onRename: (String) -> Void
+    let onForget: () -> Void
+
+    @State private var draft = ""
+    @State private var isEditing = false
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "person.crop.circle")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            if isEditing {
+                TextField("Name", text: $draft)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .focused($isFocused)
+                    // Focus after the field exists: setting it in the same
+                    // transaction that inserts the view often doesn't take,
+                    // leaving the row stuck in edit mode.
+                    .onAppear { isFocused = true }
+                    .onSubmit { commit() }
+                    .onChange(of: isFocused) { _, focused in
+                        if !focused { commit() }
+                    }
+            } else {
+                Text(profile.name)
+                    .font(.system(size: 12))
+                Text("\(profile.sampleCount) sample\(profile.sampleCount == 1 ? "" : "s")")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                if isHere {
+                    HStack(spacing: 3) {
+                        Image(systemName: "waveform")
+                            .font(.system(size: 9))
+                        Text("here")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundStyle(Color.accentColor)
+                }
+                Button {
+                    draft = profile.name
+                    isEditing = true
+                } label: {
+                    Image(systemName: "pencil")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Rename this voice")
+                Button {
+                    onForget()
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Forget this voice (removes it from the library)")
+            }
+        }
+        .contextMenu {
+            Button("Rename") {
+                draft = profile.name
+                isEditing = true
+            }
+            Button("Forget This Voice", role: .destructive) { onForget() }
+        }
+    }
+
+    private func commit() {
+        let trimmed = draft.trimmingCharacters(in: .whitespaces)
+        if !trimmed.isEmpty, trimmed != profile.name {
+            onRename(trimmed)
+        }
+        isEditing = false
+    }
+}
+
 /// One detected-speaker row: color dot, editable name, and where the current
 /// label came from (you / matched from the library / unnamed voice).
 private struct LiveSpeakerNameRow: View {
@@ -282,6 +367,7 @@ private struct LiveSpeakerNameRow: View {
     let userName: String?
     let autoName: String?
     var suggestions: [String] = []
+    var onAssignToMe: (() -> Void)? = nil
     let onCommit: (String) -> Void
 
     @State private var draft = ""
@@ -297,9 +383,15 @@ private struct LiveSpeakerNameRow: View {
                     .textFieldStyle(.plain)
                     .font(.system(size: 12))
                     .focused($isFocused)
-                    .onSubmit { onCommit(draft) }
+                    .onSubmit { commitIfChanged() }
                     .onChange(of: isFocused) { _, focused in
-                        if !focused { onCommit(draft) }
+                        if !focused { commitIfChanged() }
+                    }
+                    .onChange(of: userName) { _, newValue in
+                        // Resync when the name changes underneath us (another
+                        // surface renamed, or the assignment was cleared) so a
+                        // stale draft can't be committed on blur.
+                        if !isFocused { draft = newValue ?? "" }
                     }
                 if !suggestions.isEmpty {
                     Menu {
@@ -319,6 +411,22 @@ private struct LiveSpeakerNameRow: View {
                     .fixedSize()
                     .help("Pick from calendar invitees and saved voices")
                 }
+                if let onAssignToMe {
+                    Button {
+                        onAssignToMe()
+                    } label: {
+                        Image(systemName: "person.crop.circle.badge.checkmark")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("This is me — this voice is you, not a guest")
+                }
+            }
+            .contextMenu {
+                if let onAssignToMe {
+                    Button("This Is Me") { onAssignToMe() }
+                }
             }
             Text(caption)
                 .font(.system(size: 10))
@@ -326,6 +434,13 @@ private struct LiveSpeakerNameRow: View {
                 .padding(.leading, 13)
         }
         .onAppear { draft = userName ?? "" }
+    }
+
+    /// Commit only real changes: popover dismissal blurs every row, and a
+    /// no-op commit would still fire the rename/pin path for each speaker.
+    private func commitIfChanged() {
+        guard draft != (userName ?? "") else { return }
+        onCommit(draft)
     }
 
     private var caption: String {

@@ -8,12 +8,19 @@ struct TranscriptView: View {
     var showSearch: Bool = false
     /// Live speaker names (storageKey → name) for display.
     var speakerNames: [String: String]? = nil
+    /// Names the USER assigned (no auto-guesses). Drives suggestion exclusion
+    /// and rename pre-fill so a wrong auto-guess is never locked out of the
+    /// menus or silently converted into user intent by an unedited Save.
+    var userSpeakerNames: [String: String]? = nil
     /// Attendee names offered as one-click naming suggestions.
     var nameSuggestions: [String] = []
     /// When set, lettered speakers can be named from the bubble context menu.
     var onRenameSpeaker: ((Speaker, String) -> Void)? = nil
     /// When set, You-labeled mic lines get a "Not me" correction action.
     var onNotMe: ((Utterance) -> Void)? = nil
+    /// When set, lettered in-person lines get a "This is me" correction —
+    /// the reverse of "Not me", for when the user's own voice gets lettered.
+    var onThisIsMe: ((Utterance) -> Void)? = nil
 
     @State private var searchText = ""
     @State private var autoScrollEnabled = true
@@ -65,20 +72,26 @@ struct TranscriptView: View {
     private func liveCorrectionMenu(for utterance: Utterance) -> some View {
         if let onRenameSpeaker, utterance.speaker.isRenameable {
             let label = utterance.speaker.displayName(speakerNames: speakerNames)
-            let usedNames = Set(speakerNames?.values.map { $0 } ?? [])
+            let usedNames = Set((userSpeakerNames ?? speakerNames)?.values.map { $0 } ?? [])
             ForEach(nameSuggestions.filter { !usedNames.contains($0) }, id: \.self) { name in
                 Button("\(label) is \(name)") {
                     onRenameSpeaker(utterance.speaker, name)
                 }
             }
             Button("Name \(label)…") {
-                renameText = speakerNames?[utterance.speaker.storageKey] ?? ""
+                // Pre-fill only a USER-set name: seeding the auto-guess would
+                // let one unedited Save persist and enroll a wrong match.
+                renameText = (userSpeakerNames ?? speakerNames)?[utterance.speaker.storageKey] ?? ""
                 renamingSpeaker = utterance.speaker
             }
         }
         if let onNotMe, utterance.speaker == .you, utterance.source != .system {
             Divider()
             Button("Not me") { onNotMe(utterance) }
+        }
+        if let onThisIsMe, case .local = utterance.speaker {
+            Divider()
+            Button("This is me") { onThisIsMe(utterance) }
         }
     }
 

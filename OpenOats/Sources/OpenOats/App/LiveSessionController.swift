@@ -699,7 +699,17 @@ final class LiveSessionController {
             container.ensureMeetingServicesInitialized(settings: settings, coordinator: coordinator)
         }
         if let batchAudioTranscriber = coordinator.batchAudioTranscriber {
-            await batchAudioTranscriber.cancel()
+            // Bounded: cancel() awaits the running batch job, whose CoreML /
+            // model-download awaits are not cancellable mid-flight. A wedged
+            // batch must not hold the Start button hostage — after 10 s we
+            // abandon the old job and start the meeting anyway.
+            let cancelTask = Task { await batchAudioTranscriber.cancel() }
+            let finished = await TranscriptionEngine.awaitTeardown(
+                of: [cancelTask], timeoutSeconds: 10
+            )
+            if !finished {
+                Log.transcription.error("Batch cancel did not finish in 10s; starting meeting anyway")
+            }
         }
 
         coordinator.lastEndedSession = nil
@@ -1747,7 +1757,14 @@ final class LiveSessionController {
             ? Self.liveTranscriptNotice(for: activeTranscriptionModel, issue: liveCloudIssue, isProcessing: liveCloudIsProcessing)
             : nil
         let channelStatus = liveChannelStatus(isRunning: isRunning, transcript: nextTranscript)
-        set(\.liveTranscriptNotice, baseNotice ?? (channelStatus.isLagging ? Self.liveTranscriptLagNotice : nil))
+        // A storage write failure outranks every other notice: the meeting is
+        // running but its transcript is not reaching disk. This is the only
+        // surface for coordinator.lastStorageError — without it the failure
+        // is invisible until the user discovers an empty meeting.
+        let storageNotice = (isRunning && coordinator.lastStorageError != nil)
+            ? "Recording isn't being saved to disk (\(coordinator.lastStorageError!)). Free up space or check permissions."
+            : nil
+        set(\.liveTranscriptNotice, storageNotice ?? baseNotice ?? (channelStatus.isLagging ? Self.liveTranscriptLagNotice : nil))
         set(\.liveChannelActivity, channelStatus.activity)
         set(\.liveTranscriptEmptyStateMessage, isRunning ? Self.liveTranscriptEmptyStateMessage(for: activeTranscriptionModel, issue: liveCloudIssue, isProcessing: liveCloudIsProcessing) : nil)
         set(\.isMicMuted, coordinator.transcriptionEngine?.isMicMuted ?? false)
@@ -1792,10 +1809,46 @@ final class LiveSessionController {
             names[speaker.storageKey] = trimmed
         }
         state.liveSpeakerNames = names
+        if case .local(let n) = speaker {
+            // A manual name (typed or picked from saved voices / invitees) pins
+            // the voice: live scoring must not fold it into "You" or rename it.
+            // Clearing the name reverses the pin so scoring can resume.
+            let isAssignment = !trimmed.isEmpty && trimmed != speaker.displayLabel
+            Task {
+                if isAssignment {
+                    await coordinator.transcriptionEngine?.pinMicSpeakerUserAssigned(
+                        localSpeakerNumber: n
+                    )
+                } else {
+                    await coordinator.transcriptionEngine?.unpinMicSpeakerUserAssigned(
+                        localSpeakerNumber: n
+                    )
+                }
+            }
+        }
         Task {
             await coordinator.sessionRepository.updateSessionSpeakerNames(
                 sessionID: sessionID, speakerNames: names
             )
+        }
+    }
+
+    /// Live "This is me" on a lettered in-person speaker: the reverse of
+    /// markLiveUtteranceNotMe. Pins the voice as the user, folds the letter's
+    /// bubbles into "You", and clears any name attached to the letter.
+    func assignLiveSpeakerToMe(_ speaker: Speaker) {
+        guard case .local(let n) = speaker else { return }
+        state.liveAutoSpeakerNames.removeValue(forKey: speaker.storageKey)
+        if state.liveSpeakerNames[speaker.storageKey] != nil {
+            renameLiveSpeaker(speaker, to: "")
+        }
+        Task {
+            await coordinator.transcriptionEngine?.assignMicSpeakerToSelf(localSpeakerNumber: n)
+            coordinator.transcriptStore.relabel(from: speaker, to: .you)
+            // An in-flight classify task may have republished the auto-name
+            // between the synchronous clear above and the pin landing; clear
+            // again now that the matcher can no longer produce one.
+            state.liveAutoSpeakerNames.removeValue(forKey: speaker.storageKey)
         }
     }
 

@@ -2771,6 +2771,17 @@ struct MeetingDetailPane<SessionFolderMenuItems: View>: View {
                     }
                     .controlSize(.small)
 
+                    if let saveError = state.manualNotesSaveError {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.orange)
+                            Text(saveError)
+                                .font(.system(size: 12))
+                                .foregroundStyle(.orange)
+                        }
+                    }
+
                     if !state.loadedAttachments.isEmpty {
                         attachmentsSection(controller: controller, attachments: state.loadedAttachments)
                     }

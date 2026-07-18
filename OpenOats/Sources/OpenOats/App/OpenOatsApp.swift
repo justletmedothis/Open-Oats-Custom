@@ -147,7 +147,7 @@ public struct OpenOatsRootApp: App {
         )
 
         Window("Transcript", id: "transcript") {
-            TranscriptWindowView()
+            TranscriptWindowView(settings: settings)
                 .environment(container)
                 .environment(coordinator)
                 .environment(coordinator.transcriptStore)

@@ -694,13 +694,22 @@ actor SessionRepository {
 
     // MARK: - Notes
 
-    func saveNotes(sessionID: String, notes: GeneratedNotes) {
+    /// Returns false when the markdown itself could not be written — the one
+    /// failure that means the user's notes are not on disk. Metadata/mirror
+    /// steps stay best-effort.
+    @discardableResult
+    func saveNotes(sessionID: String, notes: GeneratedNotes) -> Bool {
         let dir = sessionDirectory(for: sessionID)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
         // Write notes.md
         let mdURL = dir.appendingPathComponent("notes.md")
-        try? notes.markdown.write(to: mdURL, atomically: true, encoding: .utf8)
+        do {
+            try notes.markdown.write(to: mdURL, atomically: true, encoding: .utf8)
+        } catch {
+            Log.sessionRepository.error("Failed to write notes.md for \(sessionID, privacy: .public): \(error, privacy: .public)")
+            return false
+        }
 
         // Write notes.meta.json
         let existingAttachments = loadNotesMeta(sessionID: sessionID)?.attachments
@@ -719,6 +728,7 @@ actor SessionRepository {
 
         // Mirror to notesFolderPath — pass markdown through to avoid re-reading from disk
         scheduleMirror(sessionID: sessionID, notesMarkdown: notes.markdown)
+        return true
     }
 
     func loadNotes(sessionID: String) -> GeneratedNotes? {

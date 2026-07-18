@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct TranscriptWindowView: View {
+    @Bindable var settings: AppSettings
     @Environment(TranscriptStore.self) private var store
     @Environment(AppCoordinator.self) private var coordinator
 
@@ -10,6 +11,13 @@ struct TranscriptWindowView: View {
                 Text("Live Transcript")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
+                if let controller = coordinator.liveSessionController {
+                    MeetingPeopleButton(
+                        state: controller.state,
+                        controller: controller,
+                        settings: settings
+                    )
+                }
                 if !store.utterances.isEmpty {
                     Button {
                         copyTranscript(store.utterances)
@@ -36,6 +44,7 @@ struct TranscriptWindowView: View {
                     let names = coordinator.liveSessionController?.state.displaySpeakerNames ?? [:]
                     return names.isEmpty ? nil : names
                 }(),
+                userSpeakerNames: coordinator.liveSessionController?.state.liveSpeakerNames,
                 nameSuggestions: coordinator.liveSessionController?.state.matchedCalendarEvent?
                     .participants.compactMap(\.displayName) ?? [],
                 onRenameSpeaker: coordinator.liveSessionController.map { c in
@@ -43,6 +52,9 @@ struct TranscriptWindowView: View {
                 },
                 onNotMe: coordinator.liveSessionController.map { c in
                     { c.markLiveUtteranceNotMe($0) }
+                },
+                onThisIsMe: coordinator.liveSessionController.map { c in
+                    { c.assignLiveSpeakerToMe($0.speaker) }
                 }
             )
         }

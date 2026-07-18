@@ -742,9 +742,11 @@ private struct IsolatedTranscriptWrapper: View {
             volatileThemText: state.volatileThemText,
             showSearch: true,
             speakerNames: state.displaySpeakerNames.isEmpty ? nil : state.displaySpeakerNames,
+            userSpeakerNames: state.liveSpeakerNames,
             nameSuggestions: state.matchedCalendarEvent?.participants.compactMap(\.displayName) ?? [],
             onRenameSpeaker: controller.map { c in { c.renameLiveSpeaker($0, to: $1) } },
-            onNotMe: controller.map { c in { c.markLiveUtteranceNotMe($0) } }
+            onNotMe: controller.map { c in { c.markLiveUtteranceNotMe($0) } },
+            onThisIsMe: controller.map { c in { c.assignLiveSpeakerToMe($0.speaker) } }
         )
     }
 }

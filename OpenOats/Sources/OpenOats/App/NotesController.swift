@@ -20,6 +20,9 @@ struct NotesState {
     var manualNotesDraft: String = ""
     var savedManualNotesMarkdown: String = ""
     var isEditingManualNotes: Bool = false
+    /// Set when a manual notes save failed to reach disk; the editor stays
+    /// open with the draft intact so nothing is lost.
+    var manualNotesSaveError: String?
     var loadedCalendarEvent: CalendarEvent?
     var notesGenerationStatus: GenerationStatus = .idle
     var cleanupStatus: CleanupStatus = .idle
@@ -790,10 +793,20 @@ final class NotesController {
                 generatedAt: existingGeneratedAt ?? Date(),
                 markdown: markdown
             )
-            await coordinator.sessionRepository.saveNotes(sessionID: sessionID, notes: notes)
+            let saved = await coordinator.sessionRepository.saveNotes(sessionID: sessionID, notes: notes)
+            guard saved else {
+                // Keep the editor open with the draft intact — closing it
+                // would show "saved" text that never reached disk.
+                if state.selectedSessionID == sessionID {
+                    state.manualNotesSaveError =
+                        "Couldn't save notes to disk. Your draft is still here; check free space and try again."
+                }
+                return
+            }
             await loadHistory()
 
             guard state.selectedSessionID == sessionID else { return }
+            state.manualNotesSaveError = nil
             state.loadedNotes = notes
             state.manualNotesDraft = notes.markdown
             state.savedManualNotesMarkdown = notes.markdown

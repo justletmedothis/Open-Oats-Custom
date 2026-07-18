@@ -104,6 +104,9 @@ final class AssemblyAIBackend: TranscriptionBackend, @unchecked Sendable {
         var request = URLRequest(url: URL(string: "https://api.assemblyai.com/v2/transcript?limit=1")!)
         request.httpMethod = "GET"
         request.setValue(apiKey, forHTTPHeaderField: "Authorization")
+        // Preflight gates the Start button; a flaky network must fail fast,
+        // not sit on the default 60 s idle timeout with Start dead.
+        request.timeoutInterval = 10
 
         let (_, response) = try await session.data(for: request)
 

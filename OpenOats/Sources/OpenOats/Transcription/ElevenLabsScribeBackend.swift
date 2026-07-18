@@ -76,6 +76,9 @@ final class ElevenLabsScribeBackend: TranscriptionBackend, @unchecked Sendable {
         var request = URLRequest(url: URL(string: "https://api.elevenlabs.io/v1/voices")!)
         request.httpMethod = "GET"
         request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
+        // Preflight gates the Start button; a flaky network must fail fast,
+        // not sit on the default 60 s idle timeout with Start dead.
+        request.timeoutInterval = 10
 
         let (_, response) = try await session.data(for: request)
 

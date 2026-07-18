@@ -96,11 +96,14 @@ final class NotesEngine {
             let task = Task { [weak self] in
                 do {
                     try await Task.sleep(for: delay)
-                    guard !Task.isCancelled else { return }
-                    self?.generatedMarkdown = markdown
+                    if !Task.isCancelled {
+                        self?.generatedMarkdown = markdown
+                    }
                 } catch {
                     // Ignore cancellation for scripted test mode.
                 }
+                // Always finish: an early return here would leak the
+                // continuation parked in awaitGeneratedMarkdown.
                 self?.isGenerating = false
                 onFinished()
             }

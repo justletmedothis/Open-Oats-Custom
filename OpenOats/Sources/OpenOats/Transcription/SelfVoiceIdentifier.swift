@@ -24,6 +24,36 @@ enum SelfVoiceIdentifier {
 
     private static let sampleRate = 16_000.0
 
+    /// Process-wide cache of the segmentation + embedding CoreML models.
+    /// FluidAudio has no cache of its own: every DiarizerModels call re-reads
+    /// both models from disk (100-500 ms each), and live drift verification
+    /// scores every few seconds — hundreds of loads per meeting without this.
+    /// A failed load is retried on the next call, not cached.
+    private actor ModelCache {
+        static let shared = ModelCache()
+        private var loadTask: Task<DiarizerModels, Error>?
+
+        func models() async throws -> DiarizerModels {
+            if let task = loadTask, let models = try? await task.value {
+                return models
+            }
+            let task = Task { try await DiarizerModels.downloadIfNeeded() }
+            loadTask = task
+            do {
+                return try await task.value
+            } catch {
+                loadTask = nil
+                throw error
+            }
+        }
+    }
+
+    private static func makeManager() async throws -> DiarizerManager {
+        let manager = DiarizerManager()
+        manager.initialize(models: try await ModelCache.shared.models())
+        return manager
+    }
+
     enum EnrollmentError: LocalizedError {
         case notEnoughSpeech
 
@@ -44,9 +74,7 @@ enum SelfVoiceIdentifier {
     /// enrolling the user's voice profile. Downloads the segmentation and
     /// embedding models on first use.
     static func extractEmbedding(from samples: [Float]) async throws -> [Float] {
-        let models = try await DiarizerModels.downloadIfNeeded()
-        let manager = DiarizerManager()
-        manager.initialize(models: models)
+        let manager = try await makeManager()
         defer { manager.cleanup() }
 
         let clip = Array(samples.prefix(Int(maxClipSeconds * sampleRate)))
@@ -69,9 +97,7 @@ enum SelfVoiceIdentifier {
     ) async throws -> Int? {
         guard speakerSegments.count >= 2 else { return nil }
 
-        let models = try await DiarizerModels.downloadIfNeeded()
-        let manager = DiarizerManager()
-        manager.initialize(models: models)
+        let manager = try await makeManager()
         defer { manager.cleanup() }
 
         var scored: [(index: Int, distance: Float)] = []
@@ -114,9 +140,7 @@ enum SelfVoiceIdentifier {
     ) async -> Bool {
         let clip = clip(from: samples, segments: segments)
         guard Double(clip.count) / sampleRate >= minClipSeconds else { return true }
-        guard let models = try? await DiarizerModels.downloadIfNeeded() else { return true }
-        let manager = DiarizerManager()
-        manager.initialize(models: models)
+        guard let manager = try? await makeManager() else { return true }
         defer { manager.cleanup() }
 
         guard let embedding = try? manager.extractSpeakerEmbedding(from: clip),
@@ -137,9 +161,7 @@ enum SelfVoiceIdentifier {
         excluding excludedIndex: Int? = nil
     ) async -> [Int: [Float]] {
         guard !speakerSegments.isEmpty else { return [:] }
-        guard let models = try? await DiarizerModels.downloadIfNeeded() else { return [:] }
-        let manager = DiarizerManager()
-        manager.initialize(models: models)
+        guard let manager = try? await makeManager() else { return [:] }
         defer { manager.cleanup() }
 
         var result: [Int: [Float]] = [:]

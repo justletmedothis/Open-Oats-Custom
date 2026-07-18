@@ -58,6 +58,9 @@ actor DiarizationManager {
         config.onsetPadFrames = 1
         config.minFramesOn = 3
         config.minFramesOff = 6
+        // We only ever read timeline.speakers segments; raw finalized
+        // prediction frames would otherwise accumulate for the whole session.
+        config.maxStoredFrames = 0
         return LSEENDDiarizer(timelineConfig: config)
     }()
     private var isInitialized = false

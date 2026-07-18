@@ -237,9 +237,12 @@ enum DiagnosticsSupport {
 
             do {
                 try process.run()
-                process.waitUntilExit()
+                // Drain both pipes BEFORE waiting: two hours of logs exceeds
+                // the 64 KB pipe buffer, and waitUntilExit-before-read
+                // deadlocks (child blocked writing, parent blocked waiting).
                 let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
                 let errors = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                process.waitUntilExit()
                 if process.terminationStatus == 0 {
                     return output.trimmingCharacters(in: .whitespacesAndNewlines)
                 }

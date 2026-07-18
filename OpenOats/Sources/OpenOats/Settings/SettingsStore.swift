@@ -1547,9 +1547,15 @@ final class SettingsStore {
         } else {
             self._enableBatchRetranscription = defaults.bool(forKey: "enableBatchRetranscription")
         }
-        self._batchTranscriptionModel = TranscriptionModel(
+        // Clamp to batch-suitable models: a stale persisted value (e.g.
+        // appleSpeech from an older build) would route the batch pass into a
+        // backend with unbounded awaits and wedge re-transcription.
+        let storedBatchModel = TranscriptionModel(
             rawValue: defaults.string(forKey: "batchTranscriptionModel") ?? ""
         ) ?? .whisperLargeV3Turbo
+        self._batchTranscriptionModel = TranscriptionModel.batchSuitableModels.contains(storedBatchModel)
+            ? storedBatchModel
+            : .whisperLargeV3Turbo
         self._enableDiarization = defaults.bool(forKey: "enableDiarization")
         self._enableMicDiarization = defaults.bool(forKey: "enableMicDiarization")
         self._expectedInRoomSpeakers = max(0, min(defaults.integer(forKey: "expectedInRoomSpeakers"), 12))

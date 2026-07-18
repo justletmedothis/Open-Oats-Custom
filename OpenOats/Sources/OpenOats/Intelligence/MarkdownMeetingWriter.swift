@@ -454,6 +454,10 @@ enum MarkdownMeetingWriter {
 
     private static func resolveBaseName(title: String?, startedAt: Date) -> String {
         let dateFmt = DateFormatter()
+        // POSIX locale pins the 24-hour pattern: without it, a system 12-hour
+        // clock preference rewrites HHmm to "h:mm AM" with a narrow no-break
+        // space, producing filenames like "2026-07-18-1154 AM-meeting.md".
+        dateFmt.locale = Locale(identifier: "en_US_POSIX")
         dateFmt.dateFormat = "yyyy-MM-dd-HHmm"
         dateFmt.timeZone = TimeZone.current
         let datePrefix = dateFmt.string(from: startedAt)
