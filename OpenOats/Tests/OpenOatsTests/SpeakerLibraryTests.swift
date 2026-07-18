@@ -117,6 +117,113 @@ final class VoiceprintReinforcementTests: XCTestCase {
     }
 }
 
+// MARK: - Live matching policy (LiveVoiceMatcher.evaluate)
+
+final class LiveVoiceMatcherPolicyTests: XCTestCase {
+    private func profile(name: String, centroid: [Float]) -> SpeakerProfile {
+        SpeakerProfile(
+            id: UUID(), name: name, centroid: centroid,
+            sampleCount: 1, createdAt: .now, updatedAt: .now
+        )
+    }
+
+    // The enrolled voiceprint outranks the library: the user's own voice must
+    // never be auto-named as a guest, even if a stored profile is also close.
+    func testSelfWinsOverLibrary() {
+        let verdict = LiveVoiceMatcher.evaluate(
+            embedding: [1, 0, 0],
+            voiceprint: [1, 0, 0],
+            profiles: [profile(name: "Matt", centroid: [1, 0, 0])],
+            isFinalAttempt: false
+        )
+        XCTAssertEqual(verdict, .isSelf)
+    }
+
+    func testLibraryMatchWhenNotSelf() {
+        let verdict = LiveVoiceMatcher.evaluate(
+            embedding: [0, 1, 0],
+            voiceprint: [1, 0, 0],
+            profiles: [profile(name: "Matt", centroid: [0, 1, 0])],
+            isFinalAttempt: false
+        )
+        XCTAssertEqual(verdict, .matchedLibrary(name: "Matt"))
+    }
+
+    func testLibraryMatchWithoutVoiceprint() {
+        let verdict = LiveVoiceMatcher.evaluate(
+            embedding: [0, 1, 0],
+            voiceprint: nil,
+            profiles: [profile(name: "Dana", centroid: [0, 1, 0])],
+            isFinalAttempt: false
+        )
+        XCTAssertEqual(verdict, .matchedLibrary(name: "Dana"))
+    }
+
+    // An unknown voice stays pending on the first attempt while a library
+    // exists (the rescore may match with more audio), and is decided for good
+    // on the final attempt.
+    func testUnknownVoicePendingThenDecided() {
+        let profiles = [profile(name: "Matt", centroid: [1, 0, 0])]
+        XCTAssertEqual(
+            LiveVoiceMatcher.evaluate(
+                embedding: [0, 0, 1], voiceprint: [0, 1, 0],
+                profiles: profiles, isFinalAttempt: false
+            ),
+            .pending
+        )
+        XCTAssertEqual(
+            LiveVoiceMatcher.evaluate(
+                embedding: [0, 0, 1], voiceprint: [0, 1, 0],
+                profiles: profiles, isFinalAttempt: true
+            ),
+            .notSelf
+        )
+    }
+
+    // With no library to consult, a voice clearly unlike the voiceprint is
+    // decided immediately (the pre-library behavior).
+    func testClearlyNotSelfWithEmptyLibraryDecidesImmediately() {
+        let verdict = LiveVoiceMatcher.evaluate(
+            embedding: [0, 0, 1],
+            voiceprint: [1, 0, 0],
+            profiles: [],
+            isFinalAttempt: false
+        )
+        XCTAssertEqual(verdict, .notSelf)
+    }
+}
+
+// MARK: - Live name display and the People popover
+
+final class LiveSpeakerNamesTests: XCTestCase {
+    // A rename the user makes must always beat a live library match for the
+    // same speaker; auto names fill in only where the user said nothing.
+    @MainActor
+    func testUserRenameWinsOverAutoName() {
+        let state = LiveSessionState()
+        state.liveAutoSpeakerNames = ["local_1": "Matt", "local_2": "Dana"]
+        state.liveSpeakerNames = ["local_1": "Matthew"]
+        XCTAssertEqual(
+            state.displaySpeakerNames,
+            ["local_1": "Matthew", "local_2": "Dana"]
+        )
+    }
+
+    func testOrderedSpeakersAreDistinctInFirstAppearanceOrder() {
+        let utterances = [
+            Utterance(text: "a", speaker: .you),
+            Utterance(text: "b", speaker: .local(2)),
+            Utterance(text: "c", speaker: .you),
+            Utterance(text: "d", speaker: .remote(1)),
+            Utterance(text: "e", speaker: .local(2)),
+        ]
+        XCTAssertEqual(
+            MeetingPeopleView.orderedSpeakers(in: utterances),
+            [.you, .local(2), .remote(1)]
+        )
+    }
+}
+
 final class VocabularyRewriterTests: XCTestCase {
     func testRewritesAliasesCaseInsensitively() {
         let rewriter = VocabularyRewriter("OpenOats: open oats, open notes\nJiz\nHermes")

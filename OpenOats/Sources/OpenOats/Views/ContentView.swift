@@ -139,6 +139,11 @@ struct ContentView: View {
                                     .foregroundStyle(.tertiary)
                             }
                             LiveActivityChip(activity: controllerState.liveChannelActivity)
+                            MeetingPeopleButton(
+                                state: controllerState,
+                                controller: liveSessionController,
+                                settings: settings
+                            )
                             if let liveTranscriptNotice = controllerState.liveTranscriptNotice {
                                 Text("·")
                                     .font(.system(size: 11))
@@ -230,7 +235,14 @@ struct ContentView: View {
                 },
                 onOpenMicrophonePrivacySettings: {
                     openMicrophonePrivacySettings()
-                }
+                },
+                peopleAccessory: AnyView(
+                    MeetingPeopleButton(
+                        state: controllerState,
+                        controller: liveSessionController,
+                        settings: settings
+                    )
+                )
             )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -729,7 +741,7 @@ private struct IsolatedTranscriptWrapper: View {
             volatileYouText: state.volatileYouText,
             volatileThemText: state.volatileThemText,
             showSearch: true,
-            speakerNames: state.liveSpeakerNames.isEmpty ? nil : state.liveSpeakerNames,
+            speakerNames: state.displaySpeakerNames.isEmpty ? nil : state.displaySpeakerNames,
             nameSuggestions: state.matchedCalendarEvent?.participants.compactMap(\.displayName) ?? [],
             onRenameSpeaker: controller.map { c in { c.renameLiveSpeaker($0, to: $1) } },
             onNotMe: controller.map { c in { c.markLiveUtteranceNotMe($0) } }
@@ -785,6 +797,7 @@ private struct IsolatedControlBarWrapper: View {
     let onConfirmDownload: () -> Void
     let onOpenSettings: () -> Void
     let onOpenMicrophonePrivacySettings: () -> Void
+    var peopleAccessory: AnyView? = nil
 
     var body: some View {
         ControlBar(
@@ -809,7 +822,8 @@ private struct IsolatedControlBarWrapper: View {
             onPauseToggle: onPauseToggle,
             onConfirmDownload: onConfirmDownload,
             onOpenSettings: onOpenSettings,
-            onOpenMicrophonePrivacySettings: onOpenMicrophonePrivacySettings
+            onOpenMicrophonePrivacySettings: onOpenMicrophonePrivacySettings,
+            peopleAccessory: peopleAccessory
         )
     }
 }

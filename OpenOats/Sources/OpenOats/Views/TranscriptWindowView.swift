@@ -33,7 +33,7 @@ struct TranscriptWindowView: View {
                 volatileThemText: store.volatileThemText,
                 showSearch: true,
                 speakerNames: {
-                    let names = coordinator.liveSessionController?.state.liveSpeakerNames ?? [:]
+                    let names = coordinator.liveSessionController?.state.displaySpeakerNames ?? [:]
                     return names.isEmpty ? nil : names
                 }(),
                 nameSuggestions: coordinator.liveSessionController?.state.matchedCalendarEvent?

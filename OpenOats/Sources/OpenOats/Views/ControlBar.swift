@@ -39,6 +39,9 @@ struct ControlBar: View {
     let onConfirmDownload: () -> Void
     let onOpenSettings: () -> Void
     let onOpenMicrophonePrivacySettings: () -> Void
+    /// Optional trailing control next to Start/Stop (the People popover
+    /// button); injected so ControlBar stays a pure data-in view.
+    var peopleAccessory: AnyView? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -179,6 +182,11 @@ struct ControlBar: View {
                         .frame(width: 40, height: 14)
                         .fixedSize(horizontal: true, vertical: false)
                         .opacity(isRecordingPaused || isMicMuted ? 0.3 : 1.0)
+                }
+
+                if let peopleAccessory {
+                    peopleAccessory
+                        .fixedSize(horizontal: true, vertical: false)
                 }
 
                 Spacer(minLength: 6)

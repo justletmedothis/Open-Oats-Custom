@@ -234,13 +234,20 @@ final class TranscriptionEngine {
         guard let dm = micDiarizationManager,
               let index = await dm.dominantIndex(from: startTime, to: endTime) else { return nil }
         let n = index + 1
-        if let matcher = selfVoiceMatcher {
+        if let matcher = voiceMatcher {
             await matcher.markNotSelf(localSpeakerNumber: n)
         }
         return .local(n)
     }
-    /// Live scoring of lettered mic speakers against the enrolled voiceprint.
-    private var selfVoiceMatcher: LiveSelfVoiceMatcher?
+    /// Live scoring of lettered mic speakers against the enrolled voiceprint
+    /// and the named speaker library.
+    private var voiceMatcher: LiveVoiceMatcher?
+
+    /// Called (on the main actor) when a live mic speaker is matched to a
+    /// named voice in the speaker library: (storageKey, name). Set by the
+    /// session controller so the live transcript shows the name without
+    /// waiting for the batch pass.
+    var onLiveSpeakerAutoNamed: ((String, String) -> Void)?
 
     /// Active transcription model captured for the current session/startup.
     @ObservationIgnored nonisolated(unsafe) var activeTranscriptionSession: ActiveTranscriptionSession?
@@ -516,13 +523,19 @@ final class TranscriptionEngine {
                 let variant = settings.diarizationVariant.lseendVariant
                 try await dm.load(variant: variant)
                 self.micDiarizationManager = dm
-                if let voiceprint = VoiceprintStore.load()?.embedding {
-                    self.selfVoiceMatcher = LiveSelfVoiceMatcher(voiceprint: voiceprint)
+                let voiceprint = VoiceprintStore.load()?.embedding
+                let libraryProfiles = SpeakerLibraryStore.load()
+                if voiceprint != nil || !libraryProfiles.isEmpty {
+                    self.voiceMatcher = LiveVoiceMatcher(
+                        voiceprint: voiceprint, profiles: libraryProfiles
+                    )
+                } else {
+                    self.voiceMatcher = nil
                 }
                 Log.transcription.info("Mic diarization model loaded")
             } else {
                 self.micDiarizationManager = nil
-                self.selfVoiceMatcher = nil
+                self.voiceMatcher = nil
             }
 
             needsModelDownload = false
@@ -567,7 +580,7 @@ final class TranscriptionEngine {
             self.vadManager = nil
             diarizationManager = nil
             micDiarizationManager = nil
-            selfVoiceMatcher = nil
+            voiceMatcher = nil
             activeTranscriptionSession = nil
             assetStatus = "Ready"
             isRunning = false
@@ -879,7 +892,7 @@ final class TranscriptionEngine {
         let doomedManagers = [diarizationManager, micDiarizationManager].compactMap { $0 }
         diarizationManager = nil
         micDiarizationManager = nil
-        selfVoiceMatcher = nil
+        voiceMatcher = nil
         micBackend = nil
         systemBackend = nil
         vadManager = nil
@@ -996,7 +1009,7 @@ final class TranscriptionEngine {
         activeTranscriptionSession = nil
         diarizationManager = nil
         micDiarizationManager = nil
-        selfVoiceMatcher = nil
+        voiceMatcher = nil
         isRunning = false
         assetStatus = "Ready"
     }
@@ -1111,7 +1124,7 @@ final class TranscriptionEngine {
         // rolling buffer, which must stay aligned with the diarizer timeline).
         if let dm = micDiarizationManager {
             var onSamples: (@Sendable ([Float]) async -> Void)?
-            if let matcher = selfVoiceMatcher {
+            if let matcher = voiceMatcher {
                 onSamples = { samples in await matcher.appendAudio(samples) }
             }
             let feeder = DiarizationStreamFeeder(
@@ -1145,7 +1158,7 @@ final class TranscriptionEngine {
                             to: segment.endTime,
                             channel: .microphone
                         )
-                        if let matcher = self.selfVoiceMatcher {
+                        if let matcher = self.voiceMatcher, matcher.hasVoiceprint {
                             // A voiceprint is enrolled: "You" is earned by matching
                             // the voiceprint, never assumed from speaking first. A
                             // mic voice stays a provisional "Speaker" until the
@@ -1169,6 +1182,9 @@ final class TranscriptionEngine {
                                 speaker = .you
                             } else if await matcher.isNotSelf(localSpeakerNumber: n) {
                                 speaker = .local(n)
+                                if let name = await matcher.libraryName(forLocalSpeakerNumber: n) {
+                                    self.onLiveSpeakerAutoNamed?(Speaker.local(n).storageKey, name)
+                                }
                             } else {
                                 switch await matcher.classifyUtterance(
                                     localSpeakerNumber: n,
@@ -1180,6 +1196,11 @@ final class TranscriptionEngine {
                                     // voice's earlier provisional bubbles too.
                                     speaker = .you
                                     store.relabel(from: .local(n), to: .you)
+                                case .matchedLibrary(let name):
+                                    // Recognized from the speaker library: keep
+                                    // the lettered label and surface the name.
+                                    speaker = .local(n)
+                                    self.onLiveSpeakerAutoNamed?(Speaker.local(n).storageKey, name)
                                 case .notSelf, .pending:
                                     // Decisively someone else, or not yet scored:
                                     // keep the provisional "Speaker" label rather
@@ -1189,8 +1210,22 @@ final class TranscriptionEngine {
                             }
                         } else {
                             // No voiceprint enrolled: fall back to the "mic = you"
-                            // default (a lone mic voice is presumed to be the user).
+                            // default (a lone mic voice is presumed to be the user),
+                            // but still score lettered guests against the library
+                            // so people from earlier meetings get their names live.
                             speaker = diarized
+                            if case .local(let n) = diarized, let matcher = self.voiceMatcher {
+                                switch await matcher.classifyUtterance(
+                                    localSpeakerNumber: n,
+                                    startTime: segment.startTime,
+                                    endTime: segment.endTime
+                                ) {
+                                case .matchedLibrary(let name):
+                                    self.onLiveSpeakerAutoNamed?(Speaker.local(n).storageKey, name)
+                                case .isSelf, .notSelf, .pending:
+                                    break
+                                }
+                            }
                         }
                     }
                     store.append(

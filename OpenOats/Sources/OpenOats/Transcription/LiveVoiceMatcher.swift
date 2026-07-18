@@ -1,28 +1,34 @@
 import Foundation
 
-/// Live counterpart of the batch self-voice relabeling: accumulates per-speaker
-/// mic audio as diarized utterances finalize, and once a lettered speaker has
-/// enough speech, scores their voice against the enrolled voiceprint so the
-/// user's own bubbles say "You" during the meeting instead of "Speaker A".
+/// Live counterpart of the batch pass's voice identification: accumulates
+/// per-speaker mic audio as diarized utterances finalize and, once a lettered
+/// speaker has enough speech, scores that voice against the enrolled self
+/// voiceprint and the named speaker library. The user's own bubbles say "You"
+/// during the meeting, and people remembered from earlier meetings get their
+/// names live instead of waiting for the batch pass.
 ///
-/// Live matching sees one candidate at a time (no runner-up margin like the
-/// batch pass), so it accepts at a stricter distance and gives borderline
-/// voices a second scoring once more audio arrives.
-actor LiveSelfVoiceMatcher {
+/// Live matching sees one candidate voice at a time (no cross-cluster
+/// runner-up margin like the batch pass), so identification uses a stricter
+/// distance and borderline voices get a second scoring once more audio arrives.
+actor LiveVoiceMatcher {
     /// Stricter than SelfVoiceIdentifier.maxMatchDistance (0.65) because the
     /// batch runner-up-margin safeguard is unavailable live.
     static let liveMatchDistance: Float = 0.55
     /// Seconds of accumulated speech before the first scoring attempt.
     static let firstScoreSeconds: Double = 3.0
-    /// Borderline voices (between liveMatchDistance and the batch ceiling) are
-    /// rescored once they reach this much audio, then decided for good.
+    /// Voices not identified on the first attempt are rescored once they reach
+    /// this much audio, then decided for good.
     static let rescoreSeconds: Double = 8.0
 
     private static let sampleRate = 16_000.0
     /// Rolling mic audio kept for slicing utterance ranges (~11.5 MB at 180 s).
     private static let rollingCapacitySeconds = 180.0
 
-    private let voiceprint: [Float]
+    private let voiceprint: [Float]?
+    private let profiles: [SpeakerProfile]
+    /// Whether a self voiceprint is enrolled. Callers use this to choose
+    /// between "You is earned by matching" and the mic-defaults-to-you policy.
+    nonisolated let hasVoiceprint: Bool
 
     private var rollingSamples: [Float] = []
     /// Absolute sample index (diarizer/ASR timeline) of rollingSamples[0].
@@ -32,12 +38,15 @@ actor LiveSelfVoiceMatcher {
     private var scoredOnce: Set<Int> = []
     private var decided: Set<Int> = []
     private var selfIndices: Set<Int> = []
+    private var matchedNames: [Int: String] = [:]
     /// Clip length a speaker must reach before the next scoring attempt, set
     /// when an attempt finds too little clean speech in the clip.
     private var minNextScoreSeconds: [Int: Double] = [:]
 
-    init(voiceprint: [Float]) {
+    init(voiceprint: [Float]?, profiles: [SpeakerProfile]) {
         self.voiceprint = voiceprint
+        self.profiles = profiles
+        self.hasVoiceprint = voiceprint != nil
     }
 
     /// Feed the same 16 kHz mono stream the diarizer receives.
@@ -51,13 +60,15 @@ actor LiveSelfVoiceMatcher {
         }
     }
 
-    /// Outcome of scoring a diarized voice against the enrolled voiceprint.
-    enum Verdict: Sendable {
+    /// Outcome of scoring a diarized voice.
+    enum Verdict: Sendable, Equatable {
         /// Not enough evidence yet to say either way.
         case pending
         /// The voice matches the enrolled voiceprint.
         case isSelf
-        /// The voice was scored and is decisively not the user.
+        /// The voice matches a named profile in the speaker library.
+        case matchedLibrary(name: String)
+        /// The voice was scored decisively: not the user, not in the library.
         case notSelf
     }
 
@@ -71,6 +82,11 @@ actor LiveSelfVoiceMatcher {
         decided.contains(n) && !selfIndices.contains(n)
     }
 
+    /// Library name a lettered speaker was live-matched to, if any.
+    func libraryName(forLocalSpeakerNumber n: Int) -> String? {
+        matchedNames[n]
+    }
+
     /// Force-mark a speaker as not the user (live "Not me" correction).
     func markNotSelf(localSpeakerNumber n: Int) {
         decided.insert(n)
@@ -79,13 +95,16 @@ actor LiveSelfVoiceMatcher {
     }
 
     /// Record a finalized utterance attributed to a diarized speaker and score
-    /// that voice once enough audio has accumulated. `.isSelf` is returned only
-    /// on the call that first identifies the user (caller may relabel).
+    /// that voice once enough audio has accumulated. `.isSelf` and
+    /// `.matchedLibrary` are returned on the call that identifies the voice
+    /// (callers may relabel / publish the name).
     func classifyUtterance(
         localSpeakerNumber n: Int, startTime: TimeInterval, endTime: TimeInterval
     ) async -> Verdict {
         guard !decided.contains(n) else {
-            return selfIndices.contains(n) ? .pending : .notSelf
+            if selfIndices.contains(n) { return .pending }
+            if let name = matchedNames[n] { return .matchedLibrary(name: name) }
+            return .notSelf
         }
 
         appendClip(for: n, startTime: startTime, endTime: endTime)
@@ -99,29 +118,67 @@ actor LiveSelfVoiceMatcher {
 
         do {
             let embedding = try await SelfVoiceIdentifier.extractEmbedding(from: clip)
-            let distance = SelfVoiceIdentifier.distance(embedding, voiceprint)
-            Log.diarization.info("Live self-voice: speaker \(n, privacy: .public) distance \(distance, privacy: .public) at \(clipSeconds, privacy: .public)s")
-
-            if distance <= Self.liveMatchDistance {
+            if let voiceprint {
+                let distance = SelfVoiceIdentifier.distance(embedding, voiceprint)
+                Log.diarization.info("Live self-voice: speaker \(n, privacy: .public) distance \(distance, privacy: .public) at \(clipSeconds, privacy: .public)s")
+            }
+            let verdict = Self.evaluate(
+                embedding: embedding,
+                voiceprint: voiceprint,
+                profiles: profiles,
+                isFinalAttempt: readyForRescore
+            )
+            switch verdict {
+            case .isSelf:
                 decided.insert(n)
                 selfIndices.insert(n)
                 clips[n] = nil
-                return .isSelf
-            }
-            if distance > SelfVoiceIdentifier.maxMatchDistance || readyForRescore {
-                // Clearly another voice, or borderline twice — stop scoring.
+            case .matchedLibrary(let name):
+                decided.insert(n)
+                matchedNames[n] = name
+                clips[n] = nil
+                Log.diarization.info("Live voice library match for speaker \(n, privacy: .public) at \(clipSeconds, privacy: .public)s")
+            case .notSelf:
                 decided.insert(n)
                 clips[n] = nil
-                return .notSelf
+            case .pending:
+                scoredOnce.insert(n)
             }
-            scoredOnce.insert(n)
+            return verdict
         } catch SelfVoiceIdentifier.EnrollmentError.notEnoughSpeech {
             // Expected while a speaker's clip is mostly non-speech; wait for
             // more audio without burning the single rescore attempt.
             minNextScoreSeconds[n] = clipSeconds + 2.0
         } catch {
-            Log.diarization.error("Live self-voice scoring failed: \(error, privacy: .public)")
+            Log.diarization.error("Live voice scoring failed: \(error, privacy: .public)")
             scoredOnce.insert(n)
+        }
+        return .pending
+    }
+
+    /// Pure scoring policy for one attempt: the enrolled voiceprint is checked
+    /// first (strict live distance), then the library (its own ceiling plus
+    /// runner-up margin). When neither is confident, an early attempt stays
+    /// pending so the voice is rescored with more audio; the final attempt
+    /// decides `.notSelf` for good. A voice clearly unlike the voiceprint with
+    /// no library to consult is decided immediately (nothing left to wait for).
+    nonisolated static func evaluate(
+        embedding: [Float],
+        voiceprint: [Float]?,
+        profiles: [SpeakerProfile],
+        isFinalAttempt: Bool
+    ) -> Verdict {
+        var selfDistance: Float = .infinity
+        if let voiceprint {
+            selfDistance = SelfVoiceIdentifier.distance(embedding, voiceprint)
+            if selfDistance <= liveMatchDistance { return .isSelf }
+        }
+        if let profile = SpeakerLibraryStore.match(embedding: embedding, in: profiles) {
+            return .matchedLibrary(name: profile.name)
+        }
+        if isFinalAttempt { return .notSelf }
+        if profiles.isEmpty, selfDistance > SelfVoiceIdentifier.maxMatchDistance {
+            return .notSelf
         }
         return .pending
     }

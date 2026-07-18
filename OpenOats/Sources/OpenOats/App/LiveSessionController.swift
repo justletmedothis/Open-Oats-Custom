@@ -72,6 +72,15 @@ final class LiveSessionState {
     /// Names the user has assigned to live speakers this session
     /// (storageKey → name). Persisted to the session as they're set.
     var liveSpeakerNames: [String: String] = [:]
+    /// Names matched live from the voice library (storageKey → name).
+    /// Display-only: user renames win over these, and the batch pass
+    /// re-derives library names authoritatively for the saved transcript.
+    var liveAutoSpeakerNames: [String: String] = [:]
+
+    /// Live display names: library matches with the user's renames on top.
+    var displaySpeakerNames: [String: String] {
+        liveAutoSpeakerNames.merging(liveSpeakerNames) { _, userName in userName }
+    }
 }
 
 /// Owns all live session side effects: polling, utterance ingestion,
@@ -758,6 +767,7 @@ final class LiveSessionController {
         pendingInitialScratchpad = nil
         state.scratchpadText = initialScratchpad ?? ""
         state.liveSpeakerNames = [:]
+        state.liveAutoSpeakerNames = [:]
         if let initialScratchpad, !initialScratchpad.isEmpty {
             await coordinator.sessionRepository.saveScratchpad(sessionID: handle.sessionID, text: initialScratchpad)
         }
@@ -769,6 +779,10 @@ final class LiveSessionController {
                 coordinator.transcriptionEngine?.audioRecorder = coordinator.audioRecorder
             } else {
                 coordinator.transcriptionEngine?.audioRecorder = nil
+            }
+
+            coordinator.transcriptionEngine?.onLiveSpeakerAutoNamed = { [weak self] key, name in
+                self?.applyLiveAutoSpeakerName(key: key, name: name)
             }
 
             await coordinator.transcriptionEngine?.start(
@@ -1755,6 +1769,16 @@ final class LiveSessionController {
     }
 
     // MARK: - Live Speaker Corrections
+
+    /// Records a live library match for a speaker (from the transcription
+    /// engine's voice matcher). Display-only: the user's own renames win, and
+    /// the batch pass re-derives library names for the saved transcript, so
+    /// nothing is persisted here.
+    func applyLiveAutoSpeakerName(key: String, name: String) {
+        guard _currentSessionID != nil else { return }
+        guard state.liveAutoSpeakerNames[key] != name else { return }
+        state.liveAutoSpeakerNames[key] = name
+    }
 
     /// Assigns a name to a live speaker (empty name clears it). Persists to the
     /// session immediately so notes generation and the batch pass see it.
