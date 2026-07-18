@@ -1,5 +1,17 @@
 import SwiftUI
 
+extension Speaker {
+    /// Whether this is an in-person (microphone channel) voice — the user or
+    /// a lettered local speaker — as opposed to a call participant. The
+    /// in-room people count compares against these only.
+    var isInRoomVoice: Bool {
+        switch self {
+        case .you, .local: true
+        case .them, .remote: false
+        }
+    }
+}
+
 /// Compact "people" button for the control bar and the live transcript
 /// header. Opens a popover that works on the fly, before and during a
 /// meeting: cap how many in-person voices diarization should separate,
@@ -19,9 +31,17 @@ struct MeetingPeopleButton: View {
                 Image(systemName: "person.2")
                     .font(.system(size: 11))
                 if state.isRunning {
-                    let count = MeetingPeopleView.orderedSpeakers(in: state.liveTranscript).count
-                    if count > 0 {
-                        Text("\(count)")
+                    let speakers = MeetingPeopleView.orderedSpeakers(in: state.liveTranscript)
+                    let expected = settings.expectedInRoomSpeakers
+                    if expected > 0 {
+                        // "Separated so far / expected" for in-room voices, so
+                        // the stepper is visibly acknowledged mid-meeting.
+                        let inRoom = speakers.filter(\.isInRoomVoice).count
+                        Text("\(inRoom)/\(expected)")
+                            .font(.system(size: 11, weight: .medium))
+                            .monospacedDigit()
+                    } else if !speakers.isEmpty {
+                        Text("\(speakers.count)")
                             .font(.system(size: 11, weight: .medium))
                             .monospacedDigit()
                     }
@@ -162,7 +182,36 @@ struct MeetingPeopleView: View {
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            let missing = Self.awaitedVoiceCount(
+                expected: settings.expectedInRoomSpeakers, speakers: speakers
+            )
+            if missing > 0 {
+                ForEach(0..<missing, id: \.self) { _ in
+                    HStack(spacing: 6) {
+                        Circle()
+                            .strokeBorder(
+                                Color.secondary.opacity(0.5),
+                                style: StrokeStyle(lineWidth: 1, dash: [1.5])
+                            )
+                            .frame(width: 7, height: 7)
+                        Text("Listening for another voice…")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text("A person gets a row here once their voice is told apart. If someone's words are landing on the wrong speaker, right-click that line in the transcript and use \u{201C}Not me\u{201D} or name it.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
+    }
+
+    /// How many expected in-room people have no separated voice yet. Remote
+    /// call voices don't count against the in-room expectation.
+    static func awaitedVoiceCount(expected: Int, speakers: [Speaker]) -> Int {
+        max(0, expected - speakers.filter(\.isInRoomVoice).count)
     }
 
     @ViewBuilder

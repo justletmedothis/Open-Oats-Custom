@@ -1178,35 +1178,27 @@ final class TranscriptionEngine {
                                 n = 1
                             }
 
-                            if await matcher.isSelf(localSpeakerNumber: n) {
+                            switch await matcher.classifyUtterance(
+                                localSpeakerNumber: n,
+                                startTime: segment.startTime,
+                                endTime: segment.endTime
+                            ) {
+                            case .isSelf:
+                                // The user's voice, confirmed now or on an
+                                // earlier utterance and re-verified since —
+                                // promote provisional lettered bubbles too.
                                 speaker = .you
-                            } else if await matcher.isNotSelf(localSpeakerNumber: n) {
+                                store.relabel(from: .local(n), to: .you)
+                            case .matchedLibrary(let name):
+                                // Recognized from the speaker library: keep
+                                // the lettered label and surface the name.
                                 speaker = .local(n)
-                                if let name = await matcher.libraryName(forLocalSpeakerNumber: n) {
-                                    self.onLiveSpeakerAutoNamed?(Speaker.local(n).storageKey, name)
-                                }
-                            } else {
-                                switch await matcher.classifyUtterance(
-                                    localSpeakerNumber: n,
-                                    startTime: segment.startTime,
-                                    endTime: segment.endTime
-                                ) {
-                                case .isSelf:
-                                    // Just confirmed as the user — promote this
-                                    // voice's earlier provisional bubbles too.
-                                    speaker = .you
-                                    store.relabel(from: .local(n), to: .you)
-                                case .matchedLibrary(let name):
-                                    // Recognized from the speaker library: keep
-                                    // the lettered label and surface the name.
-                                    speaker = .local(n)
-                                    self.onLiveSpeakerAutoNamed?(Speaker.local(n).storageKey, name)
-                                case .notSelf, .pending:
-                                    // Decisively someone else, or not yet scored:
-                                    // keep the provisional "Speaker" label rather
-                                    // than guessing "You".
-                                    speaker = .local(n)
-                                }
+                                self.onLiveSpeakerAutoNamed?(Speaker.local(n).storageKey, name)
+                            case .notSelf, .pending:
+                                // Decisively someone else, or not yet scored:
+                                // keep the provisional "Speaker" label rather
+                                // than guessing "You".
+                                speaker = .local(n)
                             }
                         } else {
                             // No voiceprint enrolled: fall back to the "mic = you"

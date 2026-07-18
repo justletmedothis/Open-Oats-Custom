@@ -180,6 +180,40 @@ final class LiveVoiceMatcherPolicyTests: XCTestCase {
         )
     }
 
+    // MARK: Drift verification (a self-decided cluster is re-checked forever)
+
+    // A fresh window within the batch self ceiling (0.65) keeps the speaker
+    // as the user; only the initial promotion uses the strict live distance.
+    func testVerifyKeepsSelfWithinBatchCeiling() {
+        let verdict = LiveVoiceMatcher.verifyVerdict(
+            embedding: [0.5, 0.8660254, 0],  // cosine distance 0.5 from voiceprint
+            voiceprint: [1, 0, 0],
+            profiles: []
+        )
+        XCTAssertEqual(verdict, .isSelf)
+    }
+
+    // A cluster that drifted to a saved voice is demoted and named — the
+    // field failure: live LS-EEND clusters born during the user's speech
+    // matched the voiceprint, then a guest inherited the "You" label.
+    func testVerifyDemotesDriftedVoiceToLibraryMatch() {
+        let verdict = LiveVoiceMatcher.verifyVerdict(
+            embedding: [0, 1, 0],
+            voiceprint: [1, 0, 0],
+            profiles: [profile(name: "Dana", centroid: [0, 1, 0])]
+        )
+        XCTAssertEqual(verdict, .matchedLibrary(name: "Dana"))
+    }
+
+    func testVerifyDemotesDriftedUnknownVoice() {
+        let verdict = LiveVoiceMatcher.verifyVerdict(
+            embedding: [0, 1, 0],
+            voiceprint: [1, 0, 0],
+            profiles: []
+        )
+        XCTAssertEqual(verdict, .notSelf)
+    }
+
     // With no library to consult, a voice clearly unlike the voiceprint is
     // decided immediately (the pre-library behavior).
     func testClearlyNotSelfWithEmptyLibraryDecidesImmediately() {
@@ -220,6 +254,18 @@ final class LiveSpeakerNamesTests: XCTestCase {
             ),
             ["Matt Feduik", "Priya"]
         )
+    }
+
+    // The in-room expectation ignores remote call voices, and a met or unset
+    // expectation shows no waiting rows.
+    func testAwaitedVoiceCountIgnoresRemoteVoices() {
+        XCTAssertEqual(
+            MeetingPeopleView.awaitedVoiceCount(expected: 3, speakers: [.you, .remote(1)]), 2
+        )
+        XCTAssertEqual(
+            MeetingPeopleView.awaitedVoiceCount(expected: 1, speakers: [.you, .local(2)]), 0
+        )
+        XCTAssertEqual(MeetingPeopleView.awaitedVoiceCount(expected: 0, speakers: [.you]), 0)
     }
 
     func testOrderedSpeakersAreDistinctInFirstAppearanceOrder() {

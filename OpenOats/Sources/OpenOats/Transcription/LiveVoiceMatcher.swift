@@ -19,6 +19,11 @@ actor LiveVoiceMatcher {
     /// Voices not identified on the first attempt are rescored once they reach
     /// this much audio, then decided for good.
     static let rescoreSeconds: Double = 8.0
+    /// Fresh speech per drift-verification window for self-decided speakers.
+    /// Live LS-EEND clusters are unstable early: a cluster can be born during
+    /// the user's speech (matching the voiceprint) and later absorb a guest's
+    /// voice, so "self" is re-verified on every window of new audio.
+    static let selfVerifySeconds: Double = 6.0
 
     private static let sampleRate = 16_000.0
     /// Rolling mic audio kept for slicing utterance ranges (~11.5 MB at 180 s).
@@ -72,21 +77,6 @@ actor LiveVoiceMatcher {
         case notSelf
     }
 
-    /// Whether a diarizer-lettered local speaker has been identified as the user.
-    func isSelf(localSpeakerNumber: Int) -> Bool {
-        selfIndices.contains(localSpeakerNumber)
-    }
-
-    /// Whether a speaker has been decisively scored as someone else.
-    func isNotSelf(localSpeakerNumber n: Int) -> Bool {
-        decided.contains(n) && !selfIndices.contains(n)
-    }
-
-    /// Library name a lettered speaker was live-matched to, if any.
-    func libraryName(forLocalSpeakerNumber n: Int) -> String? {
-        matchedNames[n]
-    }
-
     /// Force-mark a speaker as not the user (live "Not me" correction).
     func markNotSelf(localSpeakerNumber n: Int) {
         decided.insert(n)
@@ -102,7 +92,9 @@ actor LiveVoiceMatcher {
         localSpeakerNumber n: Int, startTime: TimeInterval, endTime: TimeInterval
     ) async -> Verdict {
         guard !decided.contains(n) else {
-            if selfIndices.contains(n) { return .pending }
+            if selfIndices.contains(n) {
+                return await verifySelf(n, startTime: startTime, endTime: endTime)
+            }
             if let name = matchedNames[n] { return .matchedLibrary(name: name) }
             return .notSelf
         }
@@ -154,6 +146,55 @@ actor LiveVoiceMatcher {
             scoredOnce.insert(n)
         }
         return .pending
+    }
+
+    /// Keep verifying a speaker already decided as the user. Each window of
+    /// selfVerifySeconds of fresh speech is rescored against the voiceprint;
+    /// a window clearly unlike it means the live cluster has drifted to a
+    /// different voice, so the speaker is demoted (and given one library
+    /// lookup) rather than keeping the "You" label forever. Past bubbles are
+    /// left alone — they are a mix the batch pass will relabel correctly.
+    private func verifySelf(
+        _ n: Int, startTime: TimeInterval, endTime: TimeInterval
+    ) async -> Verdict {
+        appendClip(for: n, startTime: startTime, endTime: endTime)
+        let clipSeconds = Double(clips[n]?.count ?? 0) / Self.sampleRate
+        guard clipSeconds >= Self.selfVerifySeconds, let clip = clips[n] else { return .isSelf }
+        clips[n] = nil
+        do {
+            let embedding = try await SelfVoiceIdentifier.extractEmbedding(from: clip)
+            guard let voiceprint else { return .isSelf }
+            let verdict = Self.verifyVerdict(
+                embedding: embedding, voiceprint: voiceprint, profiles: profiles
+            )
+            if verdict != .isSelf {
+                selfIndices.remove(n)
+                if case .matchedLibrary(let name) = verdict { matchedNames[n] = name }
+                let distance = SelfVoiceIdentifier.distance(embedding, voiceprint)
+                Log.diarization.info("Live self-voice demoted: speaker \(n, privacy: .public) drifted to distance \(distance, privacy: .public)")
+            }
+            return verdict
+        } catch SelfVoiceIdentifier.EnrollmentError.notEnoughSpeech {
+            // Window was mostly non-speech; start a fresh one.
+        } catch {
+            Log.diarization.error("Live self-voice verification failed: \(error, privacy: .public)")
+        }
+        return .isSelf
+    }
+
+    /// Pure drift-verification policy: a fresh window still within the batch
+    /// self ceiling keeps the speaker as the user (the strict live distance
+    /// only gates the initial promotion); a clearly different voice is scored
+    /// once against the library and otherwise becomes a lettered speaker.
+    nonisolated static func verifyVerdict(
+        embedding: [Float], voiceprint: [Float], profiles: [SpeakerProfile]
+    ) -> Verdict {
+        let distance = SelfVoiceIdentifier.distance(embedding, voiceprint)
+        guard distance > SelfVoiceIdentifier.maxMatchDistance else { return .isSelf }
+        return evaluate(
+            embedding: embedding, voiceprint: voiceprint,
+            profiles: profiles, isFinalAttempt: true
+        )
     }
 
     /// Pure scoring policy for one attempt: the enrolled voiceprint is checked
