@@ -74,6 +74,30 @@ struct MeetingPeopleView: View {
         }
     }
 
+    private var nameSuggestions: [String] {
+        Self.nameSuggestions(
+            invitees: state.matchedCalendarEvent?.participants.compactMap(\.displayName) ?? [],
+            savedVoices: library.map(\.name),
+            assignedNames: Array(state.displaySpeakerNames.values)
+        )
+    }
+
+    /// Names offered in each row's dropdown: calendar invitees first, then
+    /// saved voices, deduplicated case-insensitively and minus anyone
+    /// already assigned to a speaker.
+    static func nameSuggestions(
+        invitees: [String], savedVoices: [String], assignedNames: [String]
+    ) -> [String] {
+        var seen = Set(assignedNames.map { $0.lowercased() })
+        var names: [String] = []
+        for name in invitees + savedVoices {
+            let trimmed = name.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, seen.insert(trimmed.lowercased()).inserted else { continue }
+            names.append(trimmed)
+        }
+        return names
+    }
+
     /// Distinct speakers in order of first appearance in the live transcript.
     static func orderedSpeakers(in utterances: [Utterance]) -> [Speaker] {
         var seen = Set<String>()
@@ -127,6 +151,7 @@ struct MeetingPeopleView: View {
                         speaker: speaker,
                         userName: state.liveSpeakerNames[speaker.storageKey],
                         autoName: state.liveAutoSpeakerNames[speaker.storageKey],
+                        suggestions: speaker == .you ? [] : nameSuggestions,
                         onCommit: { name in
                             controller?.renameLiveSpeaker(speaker, to: name)
                         }
@@ -207,6 +232,7 @@ private struct LiveSpeakerNameRow: View {
     let speaker: Speaker
     let userName: String?
     let autoName: String?
+    var suggestions: [String] = []
     let onCommit: (String) -> Void
 
     @State private var draft = ""
@@ -226,6 +252,24 @@ private struct LiveSpeakerNameRow: View {
                     .onChange(of: isFocused) { _, focused in
                         if !focused { onCommit(draft) }
                     }
+                if !suggestions.isEmpty {
+                    Menu {
+                        ForEach(suggestions, id: \.self) { name in
+                            Button(name) {
+                                draft = name
+                                onCommit(name)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "chevron.down.circle")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Pick from calendar invitees and saved voices")
+                }
             }
             Text(caption)
                 .font(.system(size: 10))

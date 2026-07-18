@@ -209,6 +209,19 @@ final class LiveSpeakerNamesTests: XCTestCase {
         )
     }
 
+    // Dropdown suggestions: invitees before saved voices, case-insensitive
+    // dedup, and anyone already assigned to a speaker is dropped.
+    func testNameSuggestionsMergeAndExcludeAssigned() {
+        XCTAssertEqual(
+            MeetingPeopleView.nameSuggestions(
+                invitees: ["Dana Reeve", "Matt Feduik", " "],
+                savedVoices: ["matt feduik", "Priya"],
+                assignedNames: ["Dana Reeve"]
+            ),
+            ["Matt Feduik", "Priya"]
+        )
+    }
+
     func testOrderedSpeakersAreDistinctInFirstAppearanceOrder() {
         let utterances = [
             Utterance(text: "a", speaker: .you),
