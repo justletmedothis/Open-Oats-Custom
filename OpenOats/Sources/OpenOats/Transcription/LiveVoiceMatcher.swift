@@ -48,6 +48,17 @@ actor LiveVoiceMatcher {
     /// name). Scoring and drift verification leave these alone: user intent
     /// always beats the matcher.
     private var userPinned: Set<Int> = []
+    /// Session-local self voice references learned from "This is me" pins:
+    /// live clusters are unstable, so the user's voice can respawn as a new
+    /// lettered cluster minutes after a pin. Each pinned cluster contributes
+    /// one embedding of how the user sounds on THIS mic today, and scoring
+    /// matches against the enrolled voiceprint and these references — so the
+    /// next respawned cluster folds into "You" on its own. References come
+    /// only from explicit user pins, never from auto matches (an auto-decided
+    /// self feeding itself back in is how a wrong "You" would snowball).
+    private var selfReferences: [Int: [Float]] = [:]
+    /// Pinned clusters still waiting to contribute their reference embedding.
+    private var referencePending: Set<Int> = []
     /// Clip length a speaker must reach before the next scoring attempt, set
     /// when an attempt finds too little clean speech in the clip.
     private var minNextScoreSeconds: [Int: Double] = [:]
@@ -86,21 +97,27 @@ actor LiveVoiceMatcher {
     }
 
     /// Force-mark a speaker as not the user (live "Not me" correction).
+    /// Also retracts any self reference this cluster contributed, so a wrong
+    /// "This is me" can be fully undone.
     func markNotSelf(localSpeakerNumber n: Int) {
         decided.insert(n)
         selfIndices.remove(n)
         clips[n] = nil
         userPinned.insert(n)
+        referencePending.remove(n)
+        selfReferences[n] = nil
     }
 
     /// Force-mark a speaker as the user (live "This is me" correction).
-    /// Pinned so drift verification never demotes a user-confirmed self.
+    /// Pinned so drift verification never demotes a user-confirmed self, and
+    /// queued to contribute a self reference from its next window of speech.
     func markSelf(localSpeakerNumber n: Int) {
         decided.insert(n)
         selfIndices.insert(n)
         matchedNames[n] = nil
         clips[n] = nil
         userPinned.insert(n)
+        referencePending.insert(n)
     }
 
     /// The user assigned a name to this lettered speaker: stop scoring the
@@ -126,6 +143,8 @@ actor LiveVoiceMatcher {
         scoredOnce.remove(n)
         clips[n] = nil
         minNextScoreSeconds[n] = nil
+        referencePending.remove(n)
+        selfReferences[n] = nil
     }
 
     /// Record a finalized utterance attributed to a diarized speaker and score
@@ -167,7 +186,8 @@ actor LiveVoiceMatcher {
                 embedding: embedding,
                 voiceprint: voiceprint,
                 profiles: profiles,
-                isFinalAttempt: readyForRescore
+                isFinalAttempt: readyForRescore,
+                selfReferences: Array(selfReferences.values)
             )
             switch verdict {
             case .isSelf:
@@ -184,6 +204,12 @@ actor LiveVoiceMatcher {
                 clips[n] = nil
             case .pending:
                 scoredOnce.insert(n)
+                if readyForRescore {
+                    // Gray zone on a full clip: keep the voice undecided but
+                    // score fresh windows from here on — a frozen clip would
+                    // re-yield the same verdict forever.
+                    clips[n] = nil
+                }
             }
             return verdict
         } catch SelfVoiceIdentifier.EnrollmentError.notEnoughSpeech {
@@ -206,7 +232,10 @@ actor LiveVoiceMatcher {
     private func verifySelf(
         _ n: Int, startTime: TimeInterval, endTime: TimeInterval
     ) async -> Verdict {
-        guard !userPinned.contains(n) else { return .isSelf }
+        if userPinned.contains(n) {
+            await collectSelfReferenceIfPending(n, startTime: startTime, endTime: endTime)
+            return .isSelf
+        }
         appendClip(for: n, startTime: startTime, endTime: endTime)
         let clipSeconds = Double(clips[n]?.count ?? 0) / Self.sampleRate
         guard clipSeconds >= Self.selfVerifySeconds, let clip = clips[n] else { return .isSelf }
@@ -215,7 +244,8 @@ actor LiveVoiceMatcher {
             let embedding = try await SelfVoiceIdentifier.extractEmbedding(from: clip)
             guard let voiceprint else { return .isSelf }
             let verdict = Self.verifyVerdict(
-                embedding: embedding, voiceprint: voiceprint, profiles: profiles
+                embedding: embedding, voiceprint: voiceprint, profiles: profiles,
+                selfReferences: Array(selfReferences.values)
             )
             if verdict != .isSelf {
                 selfIndices.remove(n)
@@ -232,18 +262,41 @@ actor LiveVoiceMatcher {
         return .isSelf
     }
 
+    /// Extract one embedding from a freshly pinned cluster's next window of
+    /// speech and keep it as a session-local self reference. Retried on the
+    /// following window if extraction fails; done at most once per cluster.
+    private func collectSelfReferenceIfPending(
+        _ n: Int, startTime: TimeInterval, endTime: TimeInterval
+    ) async {
+        guard referencePending.contains(n) else { return }
+        appendClip(for: n, startTime: startTime, endTime: endTime)
+        let clipSeconds = Double(clips[n]?.count ?? 0) / Self.sampleRate
+        guard clipSeconds >= Self.selfVerifySeconds, let clip = clips[n] else { return }
+        clips[n] = nil
+        if let embedding = try? await SelfVoiceIdentifier.extractEmbedding(from: clip) {
+            referencePending.remove(n)
+            selfReferences[n] = embedding
+            Log.diarization.info("Learned self reference from pinned speaker \(n, privacy: .public)")
+        }
+    }
+
     /// Pure drift-verification policy: a fresh window still within the batch
     /// self ceiling keeps the speaker as the user (the strict live distance
     /// only gates the initial promotion); a clearly different voice is scored
     /// once against the library and otherwise becomes a lettered speaker.
     nonisolated static func verifyVerdict(
-        embedding: [Float], voiceprint: [Float], profiles: [SpeakerProfile]
+        embedding: [Float], voiceprint: [Float], profiles: [SpeakerProfile],
+        selfReferences: [[Float]] = []
     ) -> Verdict {
-        let distance = SelfVoiceIdentifier.distance(embedding, voiceprint)
+        var distance = SelfVoiceIdentifier.distance(embedding, voiceprint)
+        for reference in selfReferences {
+            distance = min(distance, SelfVoiceIdentifier.distance(embedding, reference))
+        }
         guard distance > SelfVoiceIdentifier.maxMatchDistance else { return .isSelf }
         return evaluate(
             embedding: embedding, voiceprint: voiceprint,
-            profiles: profiles, isFinalAttempt: true
+            profiles: profiles, isFinalAttempt: true,
+            selfReferences: selfReferences
         )
     }
 
@@ -257,17 +310,30 @@ actor LiveVoiceMatcher {
         embedding: [Float],
         voiceprint: [Float]?,
         profiles: [SpeakerProfile],
-        isFinalAttempt: Bool
+        isFinalAttempt: Bool,
+        selfReferences: [[Float]] = []
     ) -> Verdict {
         var selfDistance: Float = .infinity
         if let voiceprint {
             selfDistance = SelfVoiceIdentifier.distance(embedding, voiceprint)
-            if selfDistance <= liveMatchDistance { return .isSelf }
         }
+        // "This is me" references capture how the user sounds on this mic
+        // today; the nearest self evidence wins.
+        for reference in selfReferences {
+            selfDistance = min(selfDistance, SelfVoiceIdentifier.distance(embedding, reference))
+        }
+        if selfDistance <= liveMatchDistance { return .isSelf }
         if let profile = SpeakerLibraryStore.match(embedding: embedding, in: profiles) {
             return .matchedLibrary(name: profile.name)
         }
-        if isFinalAttempt { return .notSelf }
+        if isFinalAttempt {
+            // Gray zone: within the batch self ceiling but not a confident
+            // live match. Locking notSelf here permanently letters the
+            // user's slightly-off voice (observed in the field), so stay
+            // pending — the caller keeps rescoring fresh windows.
+            if selfDistance <= SelfVoiceIdentifier.maxMatchDistance { return .pending }
+            return .notSelf
+        }
         if profiles.isEmpty, selfDistance > SelfVoiceIdentifier.maxMatchDistance {
             return .notSelf
         }

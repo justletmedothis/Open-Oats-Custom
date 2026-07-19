@@ -1839,8 +1839,19 @@ final class LiveSessionController {
     func assignLiveSpeakerToMe(_ speaker: Speaker) {
         guard case .local(let n) = speaker else { return }
         state.liveAutoSpeakerNames.removeValue(forKey: speaker.storageKey)
-        if state.liveSpeakerNames[speaker.storageKey] != nil {
-            renameLiveSpeaker(speaker, to: "")
+        // Clear a stale name directly, NOT via renameLiveSpeaker: its unpin
+        // side effect would race the self pin below, and unpin-after-markSelf
+        // silently undoes "This is me".
+        if state.liveSpeakerNames[speaker.storageKey] != nil,
+           let sessionID = _currentSessionID {
+            var names = state.liveSpeakerNames
+            names.removeValue(forKey: speaker.storageKey)
+            state.liveSpeakerNames = names
+            Task {
+                await coordinator.sessionRepository.updateSessionSpeakerNames(
+                    sessionID: sessionID, speakerNames: names
+                )
+            }
         }
         Task {
             await coordinator.transcriptionEngine?.assignMicSpeakerToSelf(localSpeakerNumber: n)

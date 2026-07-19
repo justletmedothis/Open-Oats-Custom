@@ -214,6 +214,33 @@ final class LiveVoiceMatcherPolicyTests: XCTestCase {
         XCTAssertEqual(verdict, .notSelf)
     }
 
+    // A "This is me" reference matches even when the enrolled voiceprint
+    // doesn't: the user's respawned live cluster folds into You.
+    func testSelfReferenceMatchesWhenVoiceprintDoesNot() {
+        let verdict = LiveVoiceMatcher.evaluate(
+            embedding: [0, 1, 0],
+            voiceprint: [1, 0, 0],
+            profiles: [],
+            isFinalAttempt: false,
+            selfReferences: [[0, 1, 0]]
+        )
+        XCTAssertEqual(verdict, .isSelf)
+    }
+
+    // Gray zone (between the live 0.55 and batch 0.65 ceilings) must never
+    // lock the voice as a guest — it stays pending for fresh-window rescoring.
+    // The field failure: the user's slightly-off voice was lettered forever.
+    func testGrayZoneVoiceStaysPendingOnFinalAttempt() {
+        let verdict = LiveVoiceMatcher.evaluate(
+            embedding: [0.4, 0.9165151, 0],  // cosine distance 0.6 from voiceprint
+            voiceprint: [1, 0, 0],
+            profiles: [],
+            isFinalAttempt: true,
+            selfReferences: []
+        )
+        XCTAssertEqual(verdict, .pending)
+    }
+
     // With no library to consult, a voice clearly unlike the voiceprint is
     // decided immediately (the pre-library behavior).
     func testClearlyNotSelfWithEmptyLibraryDecidesImmediately() {

@@ -416,8 +416,10 @@ private struct LiveSpeakerNameRow: View {
                         onAssignToMe()
                     } label: {
                         Image(systemName: "person.crop.circle.badge.checkmark")
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                             .foregroundStyle(.secondary)
+                            .padding(3)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .help("This is me — this voice is you, not a guest")
