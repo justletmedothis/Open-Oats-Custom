@@ -254,6 +254,57 @@ final class LiveVoiceMatcherPolicyTests: XCTestCase {
     }
 }
 
+// MARK: - Live timeline fallback (batch under-split guard)
+
+final class LiveMicFallbackTimelineTests: XCTestCase {
+    private func record(
+        _ speaker: Speaker, start: Double, end: Double, source: AudioSource? = .microphone
+    ) -> SessionRecord {
+        SessionRecord(
+            speaker: speaker, text: "x", timestamp: .now,
+            suggestions: nil, kbHits: nil, suggestionDecision: nil,
+            surfacedSuggestionText: nil, conversationStateSummary: nil,
+            cleanedText: nil, suggestionID: nil, triggerUtteranceID: nil,
+            suggestionLifecycle: nil, startTime: start, endTime: end, source: source
+        )
+    }
+
+    // The field failure: live separated You + Speaker B, offline collapsed to
+    // one voice and saved the whole meeting as "You". The rebuilt timeline
+    // must keep both voices, with You on its own index as selfIndex.
+    func testRebuildsTwoVoicesWithSelfIndex() {
+        let records = [
+            record(.you, start: 0, end: 5),
+            record(.local(2), start: 6, end: 10),
+            record(.you, start: 11, end: 14),
+        ]
+        let result = BatchAudioTranscriber.liveMicFallbackTimeline(records: records)
+        XCTAssertNotNil(result)
+        XCTAssertEqual(result?.segments.count, 2)
+        XCTAssertEqual(result?.selfIndex, 2, "you takes the next index after local_2 (index 1)")
+        XCTAssertNotNil(result?.segments[1], "local_2 keeps diarizer index 1")
+    }
+
+    // Thin evidence (a voice under 3 s) must not override the offline pass.
+    func testThinSecondVoiceReturnsNil() {
+        let records = [
+            record(.you, start: 0, end: 10),
+            record(.local(1), start: 11, end: 12),
+        ]
+        XCTAssertNil(BatchAudioTranscriber.liveMicFallbackTimeline(records: records))
+    }
+
+    // Remote/system voices are not in-room evidence.
+    func testRemoteAndSystemRecordsIgnored() {
+        let records = [
+            record(.you, start: 0, end: 10),
+            record(.remote(1), start: 11, end: 20),
+            record(.local(1), start: 21, end: 30, source: .system),
+        ]
+        XCTAssertNil(BatchAudioTranscriber.liveMicFallbackTimeline(records: records))
+    }
+}
+
 // MARK: - Live name display and the People popover
 
 final class LiveSpeakerNamesTests: XCTestCase {

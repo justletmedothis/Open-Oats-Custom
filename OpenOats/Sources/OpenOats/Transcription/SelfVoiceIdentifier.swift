@@ -90,10 +90,14 @@ enum SelfVoiceIdentifier {
 
     /// Returns the diarizer speaker index whose voice matches the enrolled
     /// voiceprint, or nil when no speaker is a confident match.
+    /// - Parameter extraSelfReferences: "This is me" voice embeddings learned
+    ///   live during this session; the nearest self evidence wins, so a pin
+    ///   made mid-meeting also identifies the user in the batch pass.
     static func matchSelf(
         samples: [Float],
         speakerSegments: [Int: [DiarizationManager.SpeakerSegment]],
-        voiceprint: [Float]
+        voiceprint: [Float],
+        extraSelfReferences: [[Float]] = []
     ) async throws -> Int? {
         guard speakerSegments.count >= 2 else { return nil }
 
@@ -108,7 +112,10 @@ enum SelfVoiceIdentifier {
                 continue
             }
             let embedding = try manager.extractSpeakerEmbedding(from: clip)
-            let distance = SpeakerUtilities.cosineDistance(embedding, voiceprint)
+            var distance = SpeakerUtilities.cosineDistance(embedding, voiceprint)
+            for reference in extraSelfReferences {
+                distance = min(distance, SpeakerUtilities.cosineDistance(embedding, reference))
+            }
             guard distance.isFinite else { continue }
             scored.append((index: index, distance: distance))
             Log.diarization.info("Self-voice match: speaker \(index, privacy: .public) distance \(distance, privacy: .public)")
@@ -136,7 +143,8 @@ enum SelfVoiceIdentifier {
     static func loneVoiceIsSelf(
         samples: [Float],
         segments: [DiarizationManager.SpeakerSegment],
-        voiceprint: [Float]
+        voiceprint: [Float],
+        extraSelfReferences: [[Float]] = []
     ) async -> Bool {
         let clip = clip(from: samples, segments: segments)
         guard Double(clip.count) / sampleRate >= minClipSeconds else { return true }
@@ -145,7 +153,10 @@ enum SelfVoiceIdentifier {
 
         guard let embedding = try? manager.extractSpeakerEmbedding(from: clip),
               manager.validateEmbedding(embedding) else { return true }
-        let distance = SpeakerUtilities.cosineDistance(embedding, voiceprint)
+        var distance = SpeakerUtilities.cosineDistance(embedding, voiceprint)
+        for reference in extraSelfReferences {
+            distance = min(distance, SpeakerUtilities.cosineDistance(embedding, reference))
+        }
         Log.diarization.info("Lone mic voice self-check: distance \(distance, privacy: .public)")
         guard distance.isFinite else { return true }
         return distance <= loneVoiceMatchDistance

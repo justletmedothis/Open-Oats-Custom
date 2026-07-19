@@ -270,6 +270,9 @@ final class TranscriptionEngine {
     /// session controller so the live transcript shows the name without
     /// waiting for the batch pass.
     var onLiveSpeakerAutoNamed: ((String, String) -> Void)?
+    /// "This is me" voice references from the just-ended session, exported at
+    /// finalize for the batch pass (cleared on the next start).
+    private(set) var lastLiveSelfReferences: [[Float]] = []
 
     /// Active transcription model captured for the current session/startup.
     @ObservationIgnored nonisolated(unsafe) var activeTranscriptionSession: ActiveTranscriptionSession?
@@ -436,6 +439,7 @@ final class TranscriptionEngine {
         Log.transcription.info("start() called, isRunning=\(self.isRunning, privacy: .public)")
         guard !isRunning, downloadProgress == nil else { return }
         lastError = nil
+        lastLiveSelfReferences = []
         liveCloudTranscriptIssue = nil
         liveCloudTranscriptionIsProcessing = false
         refreshModelAvailability()
@@ -913,6 +917,12 @@ final class TranscriptionEngine {
         currentMicDeviceID = 0
         let doomedSystemCapture = systemCapture
         let doomedManagers = [diarizationManager, micDiarizationManager].compactMap { $0 }
+        // Preserve the session's "This is me" voice references for the batch
+        // pass before the matcher goes away — batch self-matching uses them
+        // alongside the enrolled voiceprint.
+        if let matcher = voiceMatcher {
+            lastLiveSelfReferences = await matcher.exportedSelfReferences()
+        }
         diarizationManager = nil
         micDiarizationManager = nil
         voiceMatcher = nil

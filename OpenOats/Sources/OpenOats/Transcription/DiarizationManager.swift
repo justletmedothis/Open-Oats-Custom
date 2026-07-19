@@ -144,6 +144,15 @@ actor DiarizationManager {
         Log.diarization.info("Offline VBx diarization complete: \(segments.count, privacy: .public) speaker(s) across \(result.segments.count, privacy: .public) segments")
     }
 
+    /// Replace the attribution source with externally supplied segments (the
+    /// live streaming timeline preserved in the session records). Used when
+    /// the offline pass under-splits what the live pass separated: all
+    /// subsequent attribution queries read these instead.
+    func useOfflineSegments(_ segments: [Int: [SpeakerSegment]]) {
+        offlineSegments = segments
+        lastDominantIndex = nil
+    }
+
     /// Speaker segments from whichever engine ran, keyed by diarizer index.
     /// Offline results win when present; otherwise the live LS-EEND timeline
     /// (finalized plus tentative segments) is normalized into the same shape.

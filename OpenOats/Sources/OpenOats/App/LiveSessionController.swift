@@ -1141,6 +1141,7 @@ final class LiveSessionController {
             let diarizeMic = settings.enableMicDiarization
             let diarizeVariant = settings.diarizationVariant
             let expectedSpeakers = settings.expectedInRoomSpeakers > 0 ? settings.expectedInRoomSpeakers : nil
+            let selfReferences = coordinator.transcriptionEngine?.lastLiveSelfReferences ?? []
             Task.detached { [batchAudioTranscriber] in
                 await batchAudioTranscriber.process(
                     sessionID: batchSessionID,
@@ -1151,7 +1152,8 @@ final class LiveSessionController {
                     enableDiarization: diarize,
                     enableMicDiarization: diarizeMic,
                     diarizationVariant: diarizeVariant,
-                    expectedInRoomSpeakers: expectedSpeakers
+                    expectedInRoomSpeakers: expectedSpeakers,
+                    liveSelfReferences: selfReferences
                 )
             }
         }

@@ -334,7 +334,8 @@ actor BatchAudioTranscriber {
         enableDiarization: Bool = false,
         enableMicDiarization: Bool = false,
         diarizationVariant: DiarizationVariant = .dihard3,
-        expectedInRoomSpeakers: Int? = nil
+        expectedInRoomSpeakers: Int? = nil,
+        liveSelfReferences: [[Float]] = []
     ) async {
         // Cancel any existing task
         currentTask?.cancel()
@@ -353,7 +354,8 @@ actor BatchAudioTranscriber {
                     enableDiarization: enableDiarization,
                     enableMicDiarization: enableMicDiarization,
                     diarizationVariant: diarizationVariant,
-                    expectedInRoomSpeakers: expectedInRoomSpeakers
+                    expectedInRoomSpeakers: expectedInRoomSpeakers,
+                    liveSelfReferences: liveSelfReferences
                 )
             } catch is CancellationError {
                 await self.setStatus(.cancelled)
@@ -540,7 +542,8 @@ actor BatchAudioTranscriber {
         enableDiarization: Bool,
         enableMicDiarization: Bool,
         diarizationVariant: DiarizationVariant,
-        expectedInRoomSpeakers: Int? = nil
+        expectedInRoomSpeakers: Int? = nil,
+        liveSelfReferences: [[Float]] = []
     ) async throws {
         Log.batchTranscription.info("Starting batch transcription for \(sessionID, privacy: .public) with \(model.rawValue, privacy: .public)")
         DiagnosticsSupport.record(category: "batch", message: "Starting batch transcription for \(sessionID) model=\(model.rawValue)")
@@ -638,6 +641,9 @@ actor BatchAudioTranscriber {
         // against the enrolled voiceprint and turns out to be a guest, not the
         // user — those .you records get lettered instead.
         var micLoneVoiceIsGuest = false
+        // The live pass's records (labels + time ranges) — evidence for the
+        // under-split guard below, loaded before the batch overwrites them.
+        let liveRecords = await sessionRepository.loadTranscript(sessionID: sessionID)
         var micSpeakerSegments: [Int: [DiarizationManager.SpeakerSegment]]?
         var micSpeakerEmbeddings: [Int: [Float]] = [:]
         var sysSpeechRanges: [(start: Date, end: Date)] = []
@@ -653,20 +659,41 @@ actor BatchAudioTranscriber {
                 )
                 if try await diarizeWholeFile(samples, with: dm, channelName: "microphone", maxSpeakers: expectedInRoomSpeakers) {
                     micDiarizer = dm
-                    let segments = await dm.speakerSegments()
+                    var segments = await dm.speakerSegments()
+                    var usedLiveFallback = false
+                    // Under-split guard: the offline pass can collapse a
+                    // multi-voice meeting into one cluster, which would save
+                    // the whole transcript as a single speaker even though
+                    // the live pass separated the voices (observed in the
+                    // field). When that degenerate collapse contradicts
+                    // solid live evidence, attribute from the live timeline
+                    // instead. Counts of 2+ stay authoritative, and an
+                    // explicit "1 expected" is honored.
+                    if segments.count <= 1,
+                       (expectedInRoomSpeakers ?? 0) != 1,
+                       let live = Self.liveMicFallbackTimeline(records: liveRecords),
+                       live.segments.count >= 2 {
+                        Log.batchTranscription.info("Offline mic diarization found \(segments.count, privacy: .public) voice(s) but the live pass separated \(live.segments.count, privacy: .public); attributing from the live timeline")
+                        await dm.useOfflineSegments(live.segments)
+                        segments = live.segments
+                        micSelfIndex = live.selfIndex
+                        usedLiveFallback = true
+                    }
                     micSpeakerSegments = segments
                     Log.batchTranscription.info("Microphone diarization complete")
 
                     // Match the enrolled voiceprint against the diarized speakers now,
                     // while the decoded samples are still in memory (before the ASR
-                    // pass extends their lifetime).
-                    if let profile = VoiceprintStore.load() {
+                    // pass extends their lifetime). Skipped when the live timeline
+                    // is in charge — it already knows which voice is the user.
+                    if !usedLiveFallback, let profile = VoiceprintStore.load() {
                         if segments.count >= 2 {
                             do {
                                 micSelfIndex = try await SelfVoiceIdentifier.matchSelf(
                                     samples: samples,
                                     speakerSegments: segments,
-                                    voiceprint: profile.embedding
+                                    voiceprint: profile.embedding,
+                                    extraSelfReferences: liveSelfReferences
                                 )
                                 if let index = micSelfIndex {
                                     Log.batchTranscription.info("Enrolled voice matched diarized mic speaker \(index, privacy: .public)")
@@ -685,7 +712,8 @@ actor BatchAudioTranscriber {
                             let isSelf = await SelfVoiceIdentifier.loneVoiceIsSelf(
                                 samples: samples,
                                 segments: loneSegments,
-                                voiceprint: profile.embedding
+                                voiceprint: profile.embedding,
+                                extraSelfReferences: liveSelfReferences
                             )
                             if !isSelf {
                                 micLoneVoiceIsGuest = true
@@ -1137,6 +1165,54 @@ actor BatchAudioTranscriber {
     /// Rewrite the diarized speaker matched to the enrolled voiceprint as .you,
     /// and reletter the remaining in-person speakers contiguously so guests
     /// always start at Speaker A.
+    /// Rebuilds a diarization timeline from the live pass's mic records, for
+    /// when offline diarization under-splits what the streaming pass
+    /// separated. Lettered speakers keep their diarizer index (local_n →
+    /// n-1); "You" takes the next free index, returned as selfIndex so the
+    /// slice pass relabels it back. Returns nil unless at least two live mic
+    /// voices each have minSecondsPerVoice of timed speech — thin evidence
+    /// must never override the offline result.
+    static func liveMicFallbackTimeline(
+        records: [SessionRecord], minSecondsPerVoice: Double = 3.0
+    ) -> (segments: [Int: [DiarizationManager.SpeakerSegment]], selfIndex: Int?)? {
+        var spans: [Speaker: [DiarizationManager.SpeakerSegment]] = [:]
+        var seconds: [Speaker: Double] = [:]
+        for record in records {
+            guard record.source == .microphone,
+                  let start = record.startTime, let end = record.endTime, end > start
+            else { continue }
+            switch record.speaker {
+            case .you, .local:
+                spans[record.speaker, default: []].append(
+                    DiarizationManager.SpeakerSegment(start: Float(start), end: Float(end))
+                )
+                seconds[record.speaker, default: 0] += end - start
+            case .them, .remote:
+                continue
+            }
+        }
+        let voiced = spans.keys.filter { (seconds[$0] ?? 0) >= minSecondsPerVoice }
+        guard voiced.count >= 2 else { return nil }
+
+        var segments: [Int: [DiarizationManager.SpeakerSegment]] = [:]
+        var selfIndex: Int?
+        let maxLocal = voiced.compactMap { speaker -> Int? in
+            if case .local(let n) = speaker { return n } else { return nil }
+        }.max() ?? 0
+        for speaker in voiced {
+            switch speaker {
+            case .local(let n):
+                segments[n - 1] = spans[speaker]
+            case .you:
+                selfIndex = maxLocal
+                segments[maxLocal] = spans[speaker]
+            default:
+                break
+            }
+        }
+        return (segments, selfIndex)
+    }
+
     private static func relabelSelfSpeaker(in records: [SessionRecord], selfIndex: Int) -> [SessionRecord] {
         let selfSpeaker = Speaker.local(selfIndex + 1)
         let remaining = Set(

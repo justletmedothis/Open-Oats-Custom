@@ -96,6 +96,12 @@ actor LiveVoiceMatcher {
         case notSelf
     }
 
+    /// Self references learned from "This is me" pins this session, exported
+    /// at teardown so the batch pass can match self with the same evidence.
+    func exportedSelfReferences() -> [[Float]] {
+        Array(selfReferences.values)
+    }
+
     /// Force-mark a speaker as not the user (live "Not me" correction).
     /// Also retracts any self reference this cluster contributed, so a wrong
     /// "This is me" can be fully undone.
