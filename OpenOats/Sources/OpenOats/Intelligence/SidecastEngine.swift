@@ -113,12 +113,26 @@ final class SidecastEngine {
     }
 
     private func startGeneration(for utterance: Utterance) {
+        // An evidence-required persona with web search off and no Knowledge
+        // Base folder can never pass accept(); leaving it in the prompt wastes
+        // the model's per-turn message budget on doomed candidates.
+        let personas = settings.enabledSidecastPersonas.filter { persona in
+            if persona.evidencePolicy == .required && !persona.webSearchEnabled
+                && settings.kbFolderURL == nil {
+                Log.sidecast.info("Excluding \(persona.name, privacy: .public): evidence required but no KB folder or web search configured")
+                return false
+            }
+            return true
+        }
+        guard !personas.isEmpty else {
+            lastErrorMessage = "All enabled personas require evidence, but no Knowledge Base folder or web search is configured."
+            return
+        }
+
         lastGenerationStartedAt = .now
         let generationID = UUID()
         activeGenerationID = generationID
         isGenerating = true
-
-        let personas = settings.enabledSidecastPersonas
         let recentExchange = transcriptStore.recentExchange
         let recentUtterances = transcriptStore.recentUtterances
         let conversationState = transcriptStore.conversationState
@@ -193,6 +207,12 @@ final class SidecastEngine {
         var lineBuffer = ""
         var acceptedCount = 0
         var parsedAnyLine = false
+        defer {
+            if acceptedCount == 0 {
+                let snippet = String(fullResponse.prefix(300)).replacingOccurrences(of: "\n", with: " | ")
+                Log.sidecast.info("Zero accepted; raw response head: \(snippet, privacy: .public)")
+            }
+        }
 
         func processLine(_ line: String) {
             var remainder = Substring(line)
@@ -280,8 +300,18 @@ final class SidecastEngine {
         evidence: [KBContextPack],
         acceptedCount: Int
     ) -> Bool {
-        guard candidate.speak else { return false }
-        guard acceptedCount < settings.sidecastIntensity.maxMessagesPerTurn else { return false }
+        // Every rejection is logged with its reason: 13 healthy generations
+        // accepting 1 bubble looked identical to "not working" from outside.
+        let who = candidate.personaName ?? candidate.personaID?.uuidString ?? "?"
+        func reject(_ reason: String) -> Bool {
+            Log.sidecast.info("Rejected candidate from \(who, privacy: .public): \(reason, privacy: .public)")
+            return false
+        }
+
+        guard candidate.speak else { return reject("model chose silence") }
+        guard acceptedCount < settings.sidecastIntensity.maxMessagesPerTurn else {
+            return reject("turn cap reached")
+        }
 
         let persona: SidecastPersona? = personas.first { p in
             if let id = candidate.personaID { return p.id == id }
@@ -289,33 +319,35 @@ final class SidecastEngine {
         } ?? candidate.personaName.flatMap { name in
             personas.first { $0.name.compare(name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
         }
-        guard let persona else { return false }
+        guard let persona else { return reject("no persona matched") }
 
         let now = Date.now
         if !settings.sidecastIntensity.skipPersonaCooldowns,
            let lastSpoken = lastSpokenAtByPersona[persona.id],
            now.timeIntervalSince(lastSpoken) < persona.cadence.cooldownSeconds {
-            return false
+            return reject("persona cooldown (\(Int(persona.cadence.cooldownSeconds))s)")
         }
 
         let cleanedText = sanitize(candidate.text, limit: persona.verbosity.characterLimit)
-        guard !cleanedText.isEmpty else { return false }
+        guard !cleanedText.isEmpty else { return reject("empty text after sanitize") }
 
         if recentBubbleTexts.contains(where: { TextSimilarity.jaccard($0, cleanedText) > 0.62 }) {
-            return false
+            return reject("duplicate of recent bubble")
         }
 
         let value = max(0, min(1, candidate.value ?? 0.5))
-        if value < settings.sidecastMinValueThreshold { return false }
+        if value < settings.sidecastMinValueThreshold {
+            return reject("value \(String(format: "%.2f", value)) below threshold \(String(format: "%.2f", settings.sidecastMinValueThreshold))")
+        }
 
         let evidenceRequired = persona.evidencePolicy == .required
         if evidenceRequired && !persona.webSearchEnabled && evidence.isEmpty {
-            return false
+            return reject("evidence required but none available")
         }
 
         let confidence = max(0, min(1, candidate.confidence ?? 0.55))
         if evidenceRequired && !persona.webSearchEnabled && confidence < 0.35 {
-            return false
+            return reject("confidence \(String(format: "%.2f", confidence)) too low for evidence-required persona")
         }
 
         let message = SidecastMessage(
@@ -335,6 +367,7 @@ final class SidecastEngine {
             recentBubbleTexts.removeFirst(recentBubbleTexts.count - 12)
         }
 
+        Log.sidecast.info("Accepted bubble for \(persona.name, privacy: .public) (value \(String(format: "%.2f", value), privacy: .public))")
         apply(message)
         return true
     }
@@ -490,9 +523,10 @@ final class SidecastEngine {
             Decide which personas should speak right now in response to the latest utterance.
 
             Quality bar:
-            - Only speak when you have genuine insight — a non-obvious fact, a sharp reframe, a useful correction, or a punchy callback.
-            - Silence is better than filler. If nothing clears the bar, output exactly one line: {"speak":false}
-            - Every bubble should make the host think "glad I saw that." If it wouldn't, don't send it.
+            - Default to speaking. On most turns the single best-matched persona should say something sharp: a non-obvious fact, a reframe, a correction, a risk, or a punchy callback.
+            - If the latest utterance contains a number, claim, decision, risk, date, or open question, at least one persona speaks. Weak models love to abstain; abstaining on substantive content is a failure, not caution.
+            - Stay silent (output exactly one line: {"speak":false}) ONLY when the latest utterance is pure filler: greetings, fragments, dead air.
+            - No filler commentary: prefer one strong message over several weak ones. Every bubble should make the host think "glad I saw that."
 
             Rules:
             - Output NDJSON: one complete JSON object per line, nothing else — no wrapper object, no code fences, no commentary before or after.
@@ -504,14 +538,16 @@ final class SidecastEngine {
             - Humor and chaos personas can be sharp, but never hateful or unusably toxic.
             - Set priority (0.0–1.0) honestly: 0.9+ means "the host needs to see this right now." Most messages should be 0.4–0.7.
             - Set confidence (0.0–1.0) based on how sure you are the claim is correct. Below 0.5 means you're guessing.
-            - Set value (0.0–1.0): how much this message would genuinely help the host. Be brutally honest.
-              0.0–0.3: generic, obvious, or hollow — anyone could say this. Do not send.
-              0.4–0.5: mildly interesting but not actionable.
+            - Set value (0.0–1.0): how much this message would genuinely help the host.
+              0.0–0.4: generic, obvious, or hollow — do not send these, use {"speak":false} instead.
+              0.5: worth a glance.
               0.6–0.7: solid insight the host probably didn't know or hadn't considered.
               0.8–1.0: genuinely surprising, corrects a misconception, or provides a killer reframe.
+              A message you choose to send is by definition 0.5 or above.
 
             Output format — one line per speaking persona, emitted in order of priority (highest first):
-            {"persona_id":"UUID","speak":true,"text":"string","priority":0.0,"confidence":0.0,"value":0.0}
+            {"persona_id":"UUID","persona":"Persona Name","speak":true,"text":"string","priority":0.0,"confidence":0.0,"value":0.0}
+            Copy persona_id and persona EXACTLY as given in the personas list — a mistyped id silently discards the whole message.
             """
         } else {
             system = systemTemplate
