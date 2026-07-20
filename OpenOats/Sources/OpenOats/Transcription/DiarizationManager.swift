@@ -263,6 +263,34 @@ actor DiarizationManager {
         return best?.index
     }
 
+    /// Raw diarizer index with the most speech overlapping the range, among
+    /// `allowed` indices only. Used to pick which existing voice a new
+    /// diarizer slot should fold into when the in-room speaker cap is
+    /// reached: the real speaker's slot usually has partial activity in the
+    /// window even when a spurious new slot wins outright.
+    func dominantIndex(
+        from startTime: TimeInterval, to endTime: TimeInterval, among allowed: Set<Int>
+    ) -> Int? {
+        guard !allowed.isEmpty else { return nil }
+        let queryStart = Float(startTime)
+        let queryEnd = Float(endTime)
+        var best: (index: Int, overlap: Float)?
+        for (index, segments) in segmentsByIndex() where allowed.contains(index) {
+            var overlap: Float = 0
+            for segment in segments {
+                let overlapStart = max(segment.start, queryStart)
+                let overlapEnd = min(segment.end, queryEnd)
+                if overlapEnd > overlapStart {
+                    overlap += overlapEnd - overlapStart
+                }
+            }
+            if overlap > 0, overlap > (best?.overlap ?? 0) {
+                best = (index, overlap)
+            }
+        }
+        return best?.index
+    }
+
     /// Returns diarized speaker runs overlapping the given range.
     /// These runs can be used to split a longer speech segment into
     /// smaller speaker-consistent chunks.

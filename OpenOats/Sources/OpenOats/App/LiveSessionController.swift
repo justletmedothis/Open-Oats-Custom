@@ -1865,6 +1865,37 @@ final class LiveSessionController {
         }
     }
 
+    /// Live "same voice" correction: two lettered in-person speakers are one
+    /// person (the diarizer split them). The target letter survives — its
+    /// name wins, and the merged letter's name transfers only onto an
+    /// unnamed target. All of the merged letter's bubbles move over, and its
+    /// future audio routes to the target for the rest of the meeting.
+    func mergeLiveSpeakers(_ source: Speaker, into target: Speaker) {
+        guard case .local(let fromN) = source,
+              case .local(let intoN) = target,
+              fromN != intoN else { return }
+        Task {
+            guard let engine = coordinator.transcriptionEngine,
+                  await engine.mergeMicSpeakers(fromDisplay: fromN, intoDisplay: intoN)
+            else { return }
+            coordinator.transcriptStore.relabel(from: source, to: target)
+            state.liveAutoSpeakerNames.removeValue(forKey: source.storageKey)
+            var names = state.liveSpeakerNames
+            let sourceName = names.removeValue(forKey: source.storageKey)
+            if let sourceName, names[target.storageKey] == nil {
+                names[target.storageKey] = sourceName
+            }
+            if names != state.liveSpeakerNames {
+                state.liveSpeakerNames = names
+                if let sessionID = _currentSessionID {
+                    await coordinator.sessionRepository.updateSessionSpeakerNames(
+                        sessionID: sessionID, speakerNames: names
+                    )
+                }
+            }
+        }
+    }
+
     /// Live "Not me" on a You-labeled mic line: tells the voiceprint matcher
     /// that voice is someone else (future lines letter automatically) and moves
     /// this line off "You". Bulk cleanup of earlier lines is left to the batch

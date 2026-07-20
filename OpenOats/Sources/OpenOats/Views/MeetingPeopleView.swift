@@ -150,7 +150,7 @@ struct MeetingPeopleView: View {
                         .monospacedDigit()
                 }
             }
-            Text("Counting you. Caps how many in-person voices get separated. Change it any time before the meeting ends; it applies when the final transcript is built.")
+            Text("Counting you. Caps how many in-person voices get separated, both live and in the final transcript. Change it any time before the meeting ends.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -169,6 +169,9 @@ struct MeetingPeopleView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } else {
+                let letteredSpeakers = speakers.filter { speaker in
+                    if case .local = speaker { true } else { false }
+                }
                 ForEach(speakers, id: \.storageKey) { speaker in
                     let isLettered: Bool = if case .local = speaker { true } else { false }
                     LiveSpeakerNameRow(
@@ -176,15 +179,23 @@ struct MeetingPeopleView: View {
                         userName: state.liveSpeakerNames[speaker.storageKey],
                         autoName: state.liveAutoSpeakerNames[speaker.storageKey],
                         suggestions: speaker == .you ? [] : nameSuggestions,
+                        mergeTargets: isLettered ? letteredSpeakers.filter { $0 != speaker }.map {
+                            MergeTarget(speaker: $0, label: displayName(for: $0))
+                        } : [],
                         onAssignToMe: isLettered ? {
                             controller?.assignLiveSpeakerToMe(speaker)
                         } : nil,
+                        onMerge: { target in
+                            controller?.mergeLiveSpeakers(speaker, into: target)
+                        },
                         onCommit: { name in
                             controller?.renameLiveSpeaker(speaker, to: name)
                         }
                     )
                 }
-                Text("Names you set here are remembered as that person's voice when the meeting is saved.")
+                Text(letteredSpeakers.count >= 2
+                     ? "Names you set here are remembered as that person's voice when the meeting is saved. If one person got split into two speakers, right-click one of them and merge."
+                     : "Names you set here are remembered as that person's voice when the meeting is saved.")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -272,6 +283,22 @@ struct MeetingPeopleView: View {
             $0.compare(name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
         }
     }
+
+    /// What a speaker is currently called, for the merge menu: the user's
+    /// name, else a library match, else the letter.
+    private func displayName(for speaker: Speaker) -> String {
+        state.liveSpeakerNames[speaker.storageKey]
+            ?? state.liveAutoSpeakerNames[speaker.storageKey]
+            ?? speaker.displayLabel
+    }
+}
+
+/// A speaker another lettered voice can be merged into, with its current
+/// display name for the menu item.
+private struct MergeTarget: Identifiable {
+    let speaker: Speaker
+    let label: String
+    var id: String { speaker.storageKey }
 }
 
 /// One saved-voice row in the manageable library index: name with sample
@@ -367,7 +394,9 @@ private struct LiveSpeakerNameRow: View {
     let userName: String?
     let autoName: String?
     var suggestions: [String] = []
+    var mergeTargets: [MergeTarget] = []
     var onAssignToMe: (() -> Void)? = nil
+    var onMerge: ((Speaker) -> Void)? = nil
     let onCommit: (String) -> Void
 
     @State private var draft = ""
@@ -428,6 +457,15 @@ private struct LiveSpeakerNameRow: View {
             .contextMenu {
                 if let onAssignToMe {
                     Button("This Is Me") { onAssignToMe() }
+                }
+                if let onMerge, !mergeTargets.isEmpty {
+                    // "Speaker B is really Speaker A": this row's letter
+                    // retires and its lines move onto the picked speaker.
+                    Menu("Same Person As") {
+                        ForEach(mergeTargets) { target in
+                            Button(target.label) { onMerge(target.speaker) }
+                        }
+                    }
                 }
             }
             Text(caption)

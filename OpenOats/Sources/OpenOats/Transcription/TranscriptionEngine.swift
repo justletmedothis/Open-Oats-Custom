@@ -230,21 +230,25 @@ final class TranscriptionEngine {
     /// Live "Not me" correction on a You-labeled mic utterance: marks the
     /// voice behind that time range as not the user and returns the lettered
     /// speaker its records should move to (nil when mic diarization is idle).
+    /// An explicit correction letters the voice even past the in-room cap.
     func markMicVoiceNotSelf(startTime: TimeInterval, endTime: TimeInterval) async -> Speaker? {
         guard let dm = micDiarizationManager,
               let index = await dm.dominantIndex(from: startTime, to: endTime) else { return nil }
-        let n = index + 1
+        let slot = micSpeakerIndexer.canonicalSlot(index + 1)
+        micSpeakerIndexer.markNotSelf(slot: slot)
         if let matcher = voiceMatcher {
-            await matcher.markNotSelf(localSpeakerNumber: n)
+            await matcher.markNotSelf(localSpeakerNumber: slot)
         }
-        return .local(n)
+        return .local(micSpeakerIndexer.displayIndex(forGuestSlot: slot))
     }
 
     /// Live "This is me" on a lettered mic speaker: pins that diarized voice
     /// as the user so its lines say "You" from here on, immune to rescoring.
     func assignMicSpeakerToSelf(localSpeakerNumber n: Int) async {
+        let slot = micSpeakerIndexer.slot(forDisplay: n) ?? n
+        micSpeakerIndexer.markSelf(slot: slot)
         guard let matcher = voiceMatcher else { return }
-        await matcher.markSelf(localSpeakerNumber: n)
+        await matcher.markSelf(localSpeakerNumber: slot)
     }
 
     /// The user assigned a name to a lettered mic speaker: stop live scoring
@@ -252,18 +256,84 @@ final class TranscriptionEngine {
     /// can't fight the manual assignment.
     func pinMicSpeakerUserAssigned(localSpeakerNumber n: Int) async {
         guard let matcher = voiceMatcher else { return }
-        await matcher.markAssignedByUser(localSpeakerNumber: n)
+        await matcher.markAssignedByUser(localSpeakerNumber: micSpeakerIndexer.slot(forDisplay: n) ?? n)
     }
 
     /// The user cleared a manual name from a lettered mic speaker: reopen
     /// live scoring for that voice.
     func unpinMicSpeakerUserAssigned(localSpeakerNumber n: Int) async {
         guard let matcher = voiceMatcher else { return }
-        await matcher.unpinUserAssignment(localSpeakerNumber: n)
+        await matcher.unpinUserAssignment(localSpeakerNumber: micSpeakerIndexer.slot(forDisplay: n) ?? n)
+    }
+
+    /// Live "same voice" merge: the diarizer split one person across two
+    /// letters. Retires `fromDisplay`, routes its slot's future audio to
+    /// `intoDisplay`, and folds the matcher's evidence for the merged voice
+    /// into the survivor. Returns false when either letter isn't active.
+    func mergeMicSpeakers(fromDisplay: Int, intoDisplay: Int) async -> Bool {
+        guard let fromSlot = micSpeakerIndexer.slot(forDisplay: fromDisplay),
+              let intoSlot = micSpeakerIndexer.slot(forDisplay: intoDisplay),
+              micSpeakerIndexer.merge(display: fromDisplay, into: intoDisplay)
+        else { return false }
+        if let matcher = voiceMatcher {
+            await matcher.mergeCluster(from: fromSlot, into: intoSlot)
+        }
+        return true
+    }
+
+    /// Resolves the display number for a lettered guest utterance. The
+    /// in-room stepper (read live, so mid-meeting changes apply) caps how
+    /// many guests may letter: at the cap, a new slot folds into whichever
+    /// existing guest the diarizer timeline says overlaps this window most.
+    /// Returns nil when the session changed underneath the fold query.
+    private func micGuestDisplay(
+        slot: Int,
+        dm: DiarizationManager,
+        start: TimeInterval,
+        end: TimeInterval,
+        bypassCap: Bool,
+        epoch: Int
+    ) async -> Int? {
+        var maxGuests: Int?
+        if !bypassCap {
+            let expected = settings.expectedInRoomSpeakers
+            if expected > 0 {
+                // The stepper counts the user; their identified voice isn't
+                // lettered, so guests get one slot fewer. Until a self voice
+                // is known, one of the letters may still be the user — allow
+                // the full count so a real guest isn't folded into them.
+                maxGuests = micSpeakerIndexer.hasKnownSelf ? max(0, expected - 1) : expected
+            }
+        }
+        var preferredFoldSlot: Int?
+        if let maxGuests,
+           micSpeakerIndexer.display(forSlot: slot) == nil,
+           micSpeakerIndexer.guestDisplayCount >= maxGuests {
+            let candidates = Set(micSpeakerIndexer.displayedGuestSlots.map { $0 - 1 })
+            if !candidates.isEmpty {
+                preferredFoldSlot = await dm.dominantIndex(
+                    from: start, to: end, among: candidates
+                ).map { $0 + 1 }
+                guard liveEpoch == epoch else { return nil }
+            }
+        }
+        return micSpeakerIndexer.displayIndex(
+            forGuestSlot: slot, maxGuests: maxGuests, preferredFoldSlot: preferredFoldSlot
+        )
     }
     /// Live scoring of lettered mic speakers against the enrolled voiceprint
     /// and the named speaker library.
     private var voiceMatcher: LiveVoiceMatcher?
+
+    /// Dense display numbering for lettered in-person voices: the streaming
+    /// diarizer's slot numbers are arbitrary (the first guest can land on
+    /// slot 3), so letters are minted in speaking order and the in-room
+    /// stepper caps how many guests may letter live. The matcher and the
+    /// diarizer speak in slots; the transcript, UI, and controller speak in
+    /// display numbers.
+    private var micSpeakerIndexer = LiveSpeakerIndexer()
+    /// Same dense numbering for remote call voices (mint-only, no cap).
+    private var remoteSpeakerIndexer = LiveSpeakerIndexer()
 
     /// Called (on the main actor) when a live mic speaker is matched to a
     /// named voice in the speaker library: (storageKey, name). Set by the
@@ -440,6 +510,8 @@ final class TranscriptionEngine {
         guard !isRunning, downloadProgress == nil else { return }
         lastError = nil
         lastLiveSelfReferences = []
+        micSpeakerIndexer = LiveSpeakerIndexer()
+        remoteSpeakerIndexer = LiveSpeakerIndexer()
         liveCloudTranscriptIssue = nil
         liveCloudTranscriptionIsProcessing = false
         refreshModelAvailability()
@@ -1193,32 +1265,30 @@ final class TranscriptionEngine {
                             to: segment.endTime,
                             channel: .microphone
                         )
-                        if let matcher = self.voiceMatcher, matcher.hasVoiceprint {
-                            // A voiceprint is enrolled: "You" is earned by matching
-                            // the voiceprint, never assumed from speaking first. A
-                            // mic voice stays a provisional "Speaker" until the
-                            // voiceprint confirms it is the user, so a guest who
-                            // speaks first is never labeled "You". Resolve the raw
-                            // diarizer index (dominantSpeaker collapses a lone voice
-                            // to .you; dominantIndex keeps the real index).
-                            let rawIndex = await dm.dominantIndex(
+                        // Resolve the raw diarizer slot behind this utterance.
+                        // With a voiceprint enrolled, "You" is earned by
+                        // matching it, never assumed from speaking first — so
+                        // the slot is resolved even when the timeline collapsed
+                        // a lone voice to .you (dominantIndex keeps the real
+                        // slot). Without one, a lone mic voice stays the
+                        // "mic = you" default. When neither yields a slot
+                        // (diarizer lag or a timeline gap), don't guess slot 1:
+                        // feeding this window into a guessed voice's clip can
+                        // wrongly confirm or demote that voice.
+                        var rawSlot: Int?
+                        if case .local(let rawN) = diarized {
+                            rawSlot = rawN
+                        } else if let matcher = self.voiceMatcher, matcher.hasVoiceprint {
+                            rawSlot = await dm.dominantIndex(
                                 from: segment.startTime, to: segment.endTime
-                            )
-                            let resolvedIndex: Int?
-                            if case .local(let localN) = diarized {
-                                resolvedIndex = localN
-                            } else if let rawIndex {
-                                resolvedIndex = rawIndex + 1
-                            } else {
-                                // No diarized overlap for this range (diarizer
-                                // lag or a timeline gap). Don't guess cluster 1:
-                                // feeding this window into a guessed cluster's
-                                // clip can wrongly confirm or demote that voice.
-                                resolvedIndex = nil
-                            }
+                            ).map { $0 + 1 }
+                        }
 
-                            if let n = resolvedIndex {
-                                let verdict = await matcher.classifyUtterance(
+                        if let rawSlot {
+                            let n = self.micSpeakerIndexer.canonicalSlot(rawSlot)
+                            let verdict: LiveVoiceMatcher.Verdict?
+                            if let matcher = self.voiceMatcher {
+                                verdict = await matcher.classifyUtterance(
                                     localSpeakerNumber: n,
                                     startTime: segment.startTime,
                                     endTime: segment.endTime
@@ -1227,52 +1297,46 @@ final class TranscriptionEngine {
                                 // a stopped session must not publish names or
                                 // bubbles into the session that replaced it.
                                 guard self.liveEpoch == epoch else { return }
-                                switch verdict {
-                                case .isSelf:
-                                    // The user's voice, confirmed now or on an
-                                    // earlier utterance and re-verified since —
-                                    // promote provisional lettered bubbles too.
-                                    speaker = .you
-                                    store.relabel(from: .local(n), to: .you)
-                                case .matchedLibrary(let name):
-                                    // Recognized from the speaker library: keep
-                                    // the lettered label and surface the name.
-                                    speaker = .local(n)
-                                    self.onLiveSpeakerAutoNamed?(Speaker.local(n).storageKey, name)
-                                case .notSelf, .pending:
-                                    // Decisively someone else, or not yet scored:
-                                    // keep the provisional "Speaker" label rather
-                                    // than guessing "You".
-                                    speaker = .local(n)
+                            } else {
+                                verdict = nil
+                            }
+                            switch verdict {
+                            case .isSelf:
+                                // The user's voice, confirmed now or on an
+                                // earlier utterance and re-verified since —
+                                // promote provisional lettered bubbles too.
+                                // (Without a voiceprint this is only reachable
+                                // via a "This is me" pin — honor it or the
+                                // letter resurrects on the next utterance.)
+                                speaker = .you
+                                self.micSpeakerIndexer.markSelf(slot: n)
+                                if let display = self.micSpeakerIndexer.display(forSlot: n) {
+                                    store.relabel(from: .local(display), to: .you)
                                 }
+                            case .matchedLibrary(let name):
+                                // Recognized from the speaker library: positive
+                                // evidence of a distinct person, so it may
+                                // letter even past the in-room cap.
+                                guard let display = await self.micGuestDisplay(
+                                    slot: n, dm: dm,
+                                    start: segment.startTime, end: segment.endTime,
+                                    bypassCap: true, epoch: epoch
+                                ) else { return }
+                                speaker = .local(display)
+                                self.onLiveSpeakerAutoNamed?(Speaker.local(display).storageKey, name)
+                            case .notSelf, .pending, nil:
+                                // Decisively someone else, or not yet scored:
+                                // keep a provisional lettered label rather
+                                // than guessing "You".
+                                guard let display = await self.micGuestDisplay(
+                                    slot: n, dm: dm,
+                                    start: segment.startTime, end: segment.endTime,
+                                    bypassCap: false, epoch: epoch
+                                ) else { return }
+                                speaker = .local(display)
                             }
                         } else {
-                            // No voiceprint enrolled: fall back to the "mic = you"
-                            // default (a lone mic voice is presumed to be the user),
-                            // but still score lettered guests against the library
-                            // so people from earlier meetings get their names live.
                             speaker = diarized
-                            if case .local(let n) = diarized, let matcher = self.voiceMatcher {
-                                let verdict = await matcher.classifyUtterance(
-                                    localSpeakerNumber: n,
-                                    startTime: segment.startTime,
-                                    endTime: segment.endTime
-                                )
-                                guard self.liveEpoch == epoch else { return }
-                                switch verdict {
-                                case .matchedLibrary(let name):
-                                    self.onLiveSpeakerAutoNamed?(Speaker.local(n).storageKey, name)
-                                case .isSelf:
-                                    // Only reachable via a user's "This is me"
-                                    // pin (no voiceprint to match otherwise) —
-                                    // honor it or the letter resurrects on the
-                                    // next utterance.
-                                    speaker = .you
-                                    store.relabel(from: .local(n), to: .you)
-                                case .notSelf, .pending:
-                                    break
-                                }
-                            }
                         }
                     }
                     // Awaits above can outlive the session; never append a
@@ -1359,9 +1423,18 @@ final class TranscriptionEngine {
                 Task { @MainActor in
                     guard let self, self.liveEpoch == epoch else { return }
                     store.volatileThemText = ""
-                    let speaker: Speaker
+                    var speaker: Speaker
                     if let dm = self.diarizationManager {
                         speaker = await dm.dominantSpeaker(from: segment.startTime, to: segment.endTime)
+                        // Re-check after the await before touching the indexer:
+                        // a stale task must not mint into the next session.
+                        guard self.liveEpoch == epoch else { return }
+                        // Remote numbering follows speaking order, not the
+                        // diarizer's arbitrary slot numbers (the first call
+                        // voice should be Speaker 1, never Speaker 3).
+                        if case .remote(let rawN) = speaker {
+                            speaker = .remote(self.remoteSpeakerIndexer.displayIndex(forGuestSlot: rawN))
+                        }
                     } else {
                         speaker = .them
                     }

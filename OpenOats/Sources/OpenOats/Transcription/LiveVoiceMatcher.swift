@@ -137,6 +137,30 @@ actor LiveVoiceMatcher {
         userPinned.insert(n)
     }
 
+    /// The user merged one lettered voice into another (live "same person"
+    /// correction): fold the merged cluster's user-granted evidence into the
+    /// survivor and drop its own bookkeeping. The engine routes all future
+    /// audio for the merged slot to the survivor, so anything left behind
+    /// would be unreachable anyway. The survivor's own verdict and name
+    /// stand; the merged voice's auto match is dropped.
+    func mergeCluster(from: Int, into: Int) {
+        guard from != into else { return }
+        if let reference = selfReferences.removeValue(forKey: from), selfReferences[into] == nil {
+            selfReferences[into] = reference
+        }
+        if userPinned.remove(from) != nil {
+            userPinned.insert(into)
+            decided.insert(into)
+        }
+        if selfIndices.remove(from) != nil { selfIndices.insert(into) }
+        if referencePending.remove(from) != nil { referencePending.insert(into) }
+        decided.remove(from)
+        scoredOnce.remove(from)
+        matchedNames[from] = nil
+        clips[from] = nil
+        minNextScoreSeconds[from] = nil
+    }
+
     /// The user cleared their assignment: reopen scoring from scratch so the
     /// voice can still be self-matched or library-named. Only reverses user
     /// pins — verdicts the matcher earned on its own stay decided.
