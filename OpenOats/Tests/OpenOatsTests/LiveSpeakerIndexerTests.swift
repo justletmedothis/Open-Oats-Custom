@@ -20,12 +20,26 @@ final class LiveSpeakerIndexerTests: XCTestCase {
     func testCapFoldsNewSlotIntoPreferredTarget() {
         var indexer = LiveSpeakerIndexer()
         XCTAssertEqual(indexer.displayIndex(forGuestSlot: 3, maxGuests: 1), 1)
-        // At the cap, a new slot folds into the diarizer-suggested target...
+        // At the cap, a new slot folds into the diarizer-suggested target
+        // and stays folded while the cap holds.
         XCTAssertEqual(indexer.displayIndex(forGuestSlot: 5, maxGuests: 1, preferredFoldSlot: 3), 1)
-        // ...permanently: the alias holds even when the cap is later lifted.
-        XCTAssertEqual(indexer.displayIndex(forGuestSlot: 5), 1)
-        XCTAssertEqual(indexer.canonicalSlot(5), 3)
+        XCTAssertEqual(indexer.displayIndex(forGuestSlot: 5, maxGuests: 1), 1)
         XCTAssertEqual(indexer.guestDisplayCount, 1)
+    }
+
+    func testRaisingCapUnfoldsFoldedVoice() {
+        var indexer = LiveSpeakerIndexer()
+        // The field failure: stepper at 2 (one guest once self is known), a
+        // third voice appears and folds into Speaker A — then the stepper
+        // goes to 3 and the voice must split off, not stay glued to A.
+        indexer.markSelf(slot: 1)
+        XCTAssertEqual(indexer.displayIndex(forGuestSlot: 2, maxGuests: 1), 1)
+        XCTAssertEqual(indexer.displayIndex(forGuestSlot: 4, maxGuests: 1, preferredFoldSlot: 2), 1)
+        XCTAssertEqual(indexer.displayIndex(forGuestSlot: 4, maxGuests: 2), 2, "raised cap frees the folded voice")
+        XCTAssertEqual(indexer.displayIndex(forGuestSlot: 4, maxGuests: 2), 2, "and it keeps its own letter")
+        XCTAssertEqual(indexer.guestDisplayCount, 2)
+        // Speaker A is untouched.
+        XCTAssertEqual(indexer.displayIndex(forGuestSlot: 2, maxGuests: 2), 1)
     }
 
     func testCapFoldsIntoMostRecentGuestWithoutPreferredTarget() {
@@ -76,16 +90,18 @@ final class LiveSpeakerIndexerTests: XCTestCase {
         XCTAssertEqual(indexer.displayIndex(forGuestSlot: 9), 3)
     }
 
-    func testMergeRewritesExistingAliases() {
+    func testMergeRewritesExistingFolds() {
         var indexer = LiveSpeakerIndexer()
         XCTAssertEqual(indexer.displayIndex(forGuestSlot: 2), 1)
         XCTAssertEqual(indexer.displayIndex(forGuestSlot: 5), 2)
         // Slot 8 folded into slot 5 under a cap...
         XCTAssertEqual(indexer.displayIndex(forGuestSlot: 8, maxGuests: 2, preferredFoldSlot: 5), 2)
-        // ...then Speaker B merged into Speaker A: 8's chain must follow.
+        // ...then Speaker B merged into Speaker A: while the cap still
+        // holds, 8's fold must follow the survivor, not the retired letter.
         XCTAssertTrue(indexer.merge(display: 2, into: 1))
-        XCTAssertEqual(indexer.displayIndex(forGuestSlot: 8), 1)
-        XCTAssertEqual(indexer.canonicalSlot(8), 2)
+        XCTAssertEqual(indexer.displayIndex(forGuestSlot: 8, maxGuests: 1), 1)
+        // With headroom the folded voice splits off as usual.
+        XCTAssertEqual(indexer.displayIndex(forGuestSlot: 8, maxGuests: 2), 3)
     }
 
     func testMergeRejectsInvalidPairs() {

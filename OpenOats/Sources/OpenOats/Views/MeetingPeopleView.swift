@@ -150,7 +150,7 @@ struct MeetingPeopleView: View {
                         .monospacedDigit()
                 }
             }
-            Text("Counting you. Caps how many in-person voices get separated, both live and in the final transcript. Change it any time before the meeting ends.")
+            Text("Counting you. Caps how many in-person voices get separated, both live and in the final transcript. Change it any time: raising it mid-meeting lets an extra voice split off from then on.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
