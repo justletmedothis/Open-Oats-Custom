@@ -126,14 +126,17 @@ private struct SidecastPersonaCard: View {
     let lifetime: TimeInterval
     let isGenerating: Bool
 
-    private var visibleMessage: SidecastMessage? {
-        guard let message else { return nil }
-        guard now.timeIntervalSince(message.timestamp) <= lifetime else { return nil }
-        return message
+    /// A delivered note stays on the card until the persona's next note
+    /// replaces it — vanishing into "Thinking…" after a few seconds read as
+    /// the sidebar constantly resetting. Past its readable window the note
+    /// just dims to signal it's aging.
+    private var isAged: Bool {
+        guard let message else { return false }
+        return now.timeIntervalSince(message.timestamp) > lifetime
     }
 
     private var timeAgoText: String? {
-        guard let message = visibleMessage else { return nil }
+        guard let message else { return nil }
         let elapsed = Int(now.timeIntervalSince(message.timestamp))
         if elapsed < 5 { return "just now" }
         if elapsed < 60 { return "\(elapsed)s ago" }
@@ -165,17 +168,17 @@ private struct SidecastPersonaCard: View {
                 }
 
                 // Message text
-                if let visibleMessage {
-                    Text(visibleMessage.text)
+                if let message {
+                    Text(message.text)
                         .font(.system(size: 13))
-                        .foregroundStyle(.white.opacity(0.9))
+                        .foregroundStyle(.white.opacity(isAged ? 0.55 : 0.9))
                         .fixedSize(horizontal: false, vertical: true)
                         .lineLimit(4)
                         .transition(.opacity.combined(with: .move(edge: .top)))
 
                     // Confidence + time
                     HStack(spacing: 6) {
-                        if visibleMessage.confidence >= 0.7 {
+                        if message.confidence >= 0.7 {
                             Circle()
                                 .fill(Color.blue)
                                 .frame(width: 6, height: 6)
@@ -220,7 +223,7 @@ private struct SidecastPersonaCard: View {
                         .stroke(persona.avatarTint.bubbleColor.opacity(0.25), lineWidth: 1)
                 )
         )
-        .animation(.easeInOut(duration: 0.3), value: visibleMessage?.id)
+        .animation(.easeInOut(duration: 0.3), value: message?.id)
     }
 
     private var personaAvatar: some View {

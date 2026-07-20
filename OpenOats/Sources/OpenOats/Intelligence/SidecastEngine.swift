@@ -44,6 +44,10 @@ final class SidecastEngine {
     /// meant a slow model never got to answer at all.
     private var pendingUtterance: Utterance?
     private var cooldownRetryTask: Task<Void, Never>?
+    /// Accepted messages waiting because their persona's current bubble is
+    /// still inside its guaranteed-readable window (latest per persona wins).
+    private var deferredMessages: [UUID: SidecastMessage] = [:]
+    private var deferredFlushTask: Task<Void, Never>?
 
     /// Idle timeout between streamed bytes. Free-tier models routinely queue
     /// the first token for 20s+ under load; a tighter budget makes them fail
@@ -241,6 +245,9 @@ final class SidecastEngine {
         generationTask = nil
         cooldownRetryTask?.cancel()
         cooldownRetryTask = nil
+        deferredFlushTask?.cancel()
+        deferredFlushTask = nil
+        deferredMessages.removeAll()
         pendingUtterance = nil
         messages.removeAll()
         isGenerating = false
@@ -322,13 +329,75 @@ final class SidecastEngine {
             recentBubbleTexts.removeFirst(recentBubbleTexts.count - 12)
         }
 
+        apply(message)
+        return true
+    }
+
+    /// Renders a message, or defers it while the persona's current bubble is
+    /// inside its guaranteed-readable window: generations run back-to-back
+    /// during a lively conversation, and replacing a note seconds after it
+    /// appeared meant the host never got to finish reading anything.
+    private func apply(_ message: SidecastMessage) {
+        let hold = settings.sidecastIntensity.bubbleLifetimeSeconds
+        if let current = self.message(for: message.personaID) {
+            let remaining = hold - Date.now.timeIntervalSince(current.timestamp)
+            if remaining > 0 {
+                deferredMessages[message.personaID] = message
+                scheduleDeferredFlush(after: remaining)
+                return
+            }
+        }
+        render(message)
+    }
+
+    private func render(_ message: SidecastMessage) {
         var updated = Dictionary(uniqueKeysWithValues: messages.map { ($0.personaID, $0) })
         updated[message.personaID] = message
         messages = updated.values.sorted { lhs, rhs in
             if lhs.timestamp != rhs.timestamp { return lhs.timestamp > rhs.timestamp }
             return lhs.personaName < rhs.personaName
         }
-        return true
+    }
+
+    private func scheduleDeferredFlush(after delay: TimeInterval) {
+        guard deferredFlushTask == nil else { return }
+        deferredFlushTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(max(0.5, delay)))
+            guard let self, !Task.isCancelled else { return }
+            self.deferredFlushTask = nil
+            self.flushDeferredMessages()
+        }
+    }
+
+    /// Applies deferred messages whose persona's bubble has been readable
+    /// long enough; anything still inside its window gets a follow-up flush.
+    private func flushDeferredMessages() {
+        guard !deferredMessages.isEmpty else { return }
+        let hold = settings.sidecastIntensity.bubbleLifetimeSeconds
+        var nextDelay: TimeInterval?
+        for (personaID, deferred) in deferredMessages {
+            if let current = message(for: personaID) {
+                let remaining = hold - Date.now.timeIntervalSince(current.timestamp)
+                if remaining > 0 {
+                    nextDelay = min(nextDelay ?? remaining, remaining)
+                    continue
+                }
+            }
+            deferredMessages.removeValue(forKey: personaID)
+            // Re-stamp so the readable window starts when the bubble appears,
+            // not when the model produced it mid-hold.
+            render(SidecastMessage(
+                personaID: deferred.personaID,
+                personaName: deferred.personaName,
+                text: deferred.text,
+                timestamp: .now,
+                confidence: deferred.confidence,
+                priority: deferred.priority,
+                value: deferred.value,
+                sourceBreadcrumb: deferred.sourceBreadcrumb
+            ))
+        }
+        if let nextDelay { scheduleDeferredFlush(after: nextDelay) }
     }
 
     private static let sanitizePatterns: [(NSRegularExpression, String)] = {
