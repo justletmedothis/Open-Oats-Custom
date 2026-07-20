@@ -232,6 +232,95 @@ struct BatchTranscriptionSegmentLayout {
     }
 }
 
+/// Moves the batch pass's speaker labels onto the live transcript's words.
+///
+/// The batch pass does two separable jobs: re-transcribing the audio and
+/// re-clustering the speakers. Offline re-clustering is still much better than
+/// the streaming diarizer, but with Apple SpeechTranscriber as the live engine
+/// the batch ASR is no longer better than the live text it replaces (it merges
+/// and drops lines, and language-flips into gibberish on music and noise). So
+/// for those sessions the labels move onto the live records and the live words
+/// stay.
+enum BatchSpeakerRelabeler {
+    /// Fraction of live records that must carry timings for mapping to be
+    /// meaningful; below this the caller keeps the old replace-everything path.
+    static let minimumTimedFraction = 0.6
+
+    static func timedFraction(of records: [SessionRecord]) -> Double {
+        guard !records.isEmpty else { return 0 }
+        let timed = records.count { $0.startTime != nil && $0.endTime != nil }
+        return Double(timed) / Double(records.count)
+    }
+
+    /// Returns the live records with each speaker replaced by the label of the
+    /// batch record it overlaps most on the same capture channel.
+    ///
+    /// Records the batch pass never covered (its VAD dropped that stretch) have
+    /// no batch label to adopt. Keeping the live number would be a silent lie:
+    /// live "Speaker C" and batch "Speaker C" are different label spaces and
+    /// can mean different people. Those numbers are instead reassigned above
+    /// the batch pass's highest number, consistently per live speaker, so an
+    /// uncovered voice stays distinct without impersonating a batch speaker.
+    static func relabel(
+        liveRecords: [SessionRecord],
+        batchRecords: [SessionRecord]
+    ) -> [SessionRecord] {
+        guard !batchRecords.isEmpty else { return liveRecords }
+
+        func channel(of record: SessionRecord) -> AudioSource {
+            record.source ?? (record.speaker.isRemote ? .system : .microphone)
+        }
+
+        var nextLocal = batchRecords.compactMap { record -> Int? in
+            if case .local(let n) = record.speaker { return n }
+            return nil
+        }.max() ?? 0
+        var nextRemote = batchRecords.compactMap { record -> Int? in
+            if case .remote(let n) = record.speaker { return n }
+            return nil
+        }.max() ?? 0
+        var carriedLocal: [Int: Int] = [:]
+        var carriedRemote: [Int: Int] = [:]
+
+        func carryForward(_ speaker: Speaker) -> Speaker {
+            switch speaker {
+            case .local(let n):
+                if let mapped = carriedLocal[n] { return .local(mapped) }
+                nextLocal += 1
+                carriedLocal[n] = nextLocal
+                return .local(nextLocal)
+            case .remote(let n):
+                if let mapped = carriedRemote[n] { return .remote(mapped) }
+                nextRemote += 1
+                carriedRemote[n] = nextRemote
+                return .remote(nextRemote)
+            case .you, .them:
+                return speaker
+            }
+        }
+
+        return liveRecords.map { live in
+            guard let liveStart = live.startTime, let liveEnd = live.endTime else { return live }
+            let liveChannel = channel(of: live)
+
+            var bestSpeaker: Speaker?
+            var bestOverlap: TimeInterval = 0
+            for batch in batchRecords {
+                guard channel(of: batch) == liveChannel else { continue }
+                guard let batchStart = batch.startTime, let batchEnd = batch.endTime else { continue }
+                let overlap = min(liveEnd, batchEnd) - max(liveStart, batchStart)
+                if overlap > bestOverlap {
+                    bestOverlap = overlap
+                    bestSpeaker = batch.speaker
+                }
+            }
+
+            let resolved = (bestOverlap > 0 ? bestSpeaker : nil) ?? carryForward(live.speaker)
+            return live.speaker == resolved ? live : live.withSpeaker(resolved)
+        }
+    }
+}
+
 struct BatchTranscriptOverwriteGuard {
     private struct TranscriptStats {
         let recordCount: Int
@@ -895,6 +984,20 @@ actor BatchAudioTranscriber {
         allRecords.sort { $0.timestamp < $1.timestamp }
         let existingRecords = await sessionRepository.loadTranscript(sessionID: sessionID)
 
+        // Sessions whose live engine already produced better words than the
+        // batch backend keep those words and take only the speaker labels.
+        let liveEngine = await sessionRepository.loadSession(id: sessionID).index.engine
+        let liveTextIsAuthoritative = liveEngine == TranscriptionModel.appleSpeech.rawValue
+        let timedFraction = BatchSpeakerRelabeler.timedFraction(of: existingRecords)
+        let relabelOnly = liveTextIsAuthoritative
+            && !existingRecords.isEmpty
+            && timedFraction >= BatchSpeakerRelabeler.minimumTimedFraction
+        if liveTextIsAuthoritative && !relabelOnly && !existingRecords.isEmpty {
+            Log.batchTranscription.info(
+                "Live engine text is authoritative but only \(Int(timedFraction * 100), privacy: .public)% of live records carry timings; replacing transcript instead of relabeling"
+            )
+        }
+
         guard !allRecords.isEmpty else {
             Log.batchTranscription.warning("Batch transcription produced no records for \(sessionID, privacy: .public)")
             if existingRecords.isEmpty {
@@ -907,6 +1010,10 @@ actor BatchAudioTranscriber {
             return
         }
 
+        // The guard protects the transcript's words from a bad batch run. In
+        // relabel-only mode the words are the live ones either way, so a batch
+        // collapse just means the labels aren't trustworthy: keep the live
+        // transcript untouched rather than failing the session.
         if let rejectionReason = BatchTranscriptOverwriteGuard.rejectionReason(
             existingRecords: existingRecords,
             replacementRecords: allRecords
@@ -917,6 +1024,29 @@ actor BatchAudioTranscriber {
             DiagnosticsSupport.record(category: "batch", message: "Rejected batch overwrite for \(sessionID): \(rejectionReason)")
             status = .failed(rejectionReason)
             return
+        }
+
+        if relabelOnly {
+            var relabeled = BatchSpeakerRelabeler.relabel(
+                liveRecords: existingRecords,
+                batchRecords: allRecords
+            )
+            let changed = zip(existingRecords, relabeled).count { $0.speaker != $1.speaker }
+
+            // Echo suppression ran against the batch mic records above; redo it
+            // for the records actually being saved.
+            var micRelabeled = relabeled.filter { ($0.source ?? ($0.speaker.isRemote ? .system : .microphone)) == .microphone }
+            let sysRelabeled = relabeled.filter { ($0.source ?? ($0.speaker.isRemote ? .system : .microphone)) == .system }
+            AcousticEchoFilter.suppress(micRecords: &micRelabeled, against: sysRelabeled)
+            relabeled = (micRelabeled + sysRelabeled).sorted { $0.timestamp < $1.timestamp }
+            Log.batchTranscription.info(
+                "Relabel-only pass for \(sessionID, privacy: .public): kept live text, updated \(changed, privacy: .public) speaker label(s)"
+            )
+            DiagnosticsSupport.record(
+                category: "batch",
+                message: "Relabeled speakers for \(sessionID) (kept live text, \(changed) label change(s))"
+            )
+            allRecords = relabeled
         }
 
         // Names assigned to lettered speakers during the live session are keyed

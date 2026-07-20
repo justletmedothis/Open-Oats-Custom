@@ -328,6 +328,108 @@ final class BatchAudioTranscriberTests: XCTestCase {
         XCTAssertEqual(demoted.map(\.speaker), [.local(1), .them, .local(2)])
     }
 
+    // MARK: - Relabel-only pass (keep live words, take batch speakers)
+
+    private func timed(
+        _ speaker: Speaker,
+        _ text: String,
+        _ start: TimeInterval,
+        _ end: TimeInterval,
+        source: AudioSource = .microphone,
+        base: Date = Date(timeIntervalSince1970: 1_000)
+    ) -> SessionRecord {
+        SessionRecord(
+            speaker: speaker,
+            text: text,
+            timestamp: base.addingTimeInterval(start),
+            startTime: start,
+            endTime: end,
+            source: source
+        )
+    }
+
+    func testRelabelKeepsLiveTextAndTakesBatchSpeakers() {
+        // The field failure: live (Apple SpeechTranscriber) text was clean but
+        // the batch pass replaced it with merged, partly hallucinated words.
+        let live = [
+            timed(.you, "Revenue grew twelve percent.", 0, 4),
+            timed(.you, "Churn ticked up to six percent.", 5, 9),
+        ]
+        let batch = [
+            timed(.you, "Revenue grew 12%.", 0, 4),
+            timed(.local(1), "Херн тикед ап.", 5, 9),
+        ]
+
+        let result = BatchSpeakerRelabeler.relabel(liveRecords: live, batchRecords: batch)
+
+        XCTAssertEqual(result.map(\.text), live.map(\.text), "live words survive")
+        XCTAssertEqual(result.map(\.speaker), [.you, .local(1)], "batch labels applied")
+    }
+
+    func testRelabelPicksTheDominantOverlapAndIgnoresOtherChannel() {
+        let live = [timed(.local(1), "Mostly B speaking here.", 10, 20)]
+        let batch = [
+            timed(.local(1), "", 10, 12),
+            timed(.local(2), "", 12, 20),
+            // Same time range on the call channel must never claim mic audio.
+            timed(.remote(1), "", 10, 20, source: .system),
+        ]
+
+        let result = BatchSpeakerRelabeler.relabel(liveRecords: live, batchRecords: batch)
+
+        XCTAssertEqual(result.map(\.speaker), [.local(2)])
+    }
+
+    func testUncoveredLiveSpeakersMoveAboveTheBatchNumbers() {
+        // Batch VAD dropped these stretches. Live "Speaker B" must not inherit
+        // batch "Speaker B" (different label spaces, possibly different people)
+        // so it is carried above the batch pass's highest number instead.
+        let live = [
+            timed(.local(1), "Covered by batch.", 0, 5),
+            timed(.local(2), "Quiet aside nobody caught.", 30, 34),
+            timed(.local(2), "Same voice, still uncovered.", 40, 44),
+            timed(.local(3), "A different uncovered voice.", 50, 54),
+        ]
+        let batch = [
+            timed(.local(1), "", 0, 5),
+            timed(.local(2), "", 10, 20),
+        ]
+
+        let result = BatchSpeakerRelabeler.relabel(liveRecords: live, batchRecords: batch)
+
+        XCTAssertEqual(result.map(\.speaker), [.local(1), .local(3), .local(3), .local(4)])
+        XCTAssertEqual(result.map(\.text), live.map(\.text))
+    }
+
+    func testUncoveredSelfAndCallFallbackLabelsAreLeftAlone() {
+        // .you and .them are not numbered slots, so they cannot collide.
+        let live = [
+            timed(.you, "My own aside.", 30, 32),
+            timed(.them, "Call audio with no diarization.", 40, 42, source: .system),
+        ]
+        let batch = [timed(.local(1), "", 0, 5)]
+
+        let result = BatchSpeakerRelabeler.relabel(liveRecords: live, batchRecords: batch)
+
+        XCTAssertEqual(result.map(\.speaker), [.you, .them])
+    }
+
+    func testRelabelRequiresEnoughTimedLiveRecords() {
+        let base = Date(timeIntervalSince1970: 1_000)
+        let untimed = (0..<4).map {
+            SessionRecord(speaker: .you, text: "no timings", timestamp: base.addingTimeInterval(Double($0)))
+        }
+        XCTAssertEqual(BatchSpeakerRelabeler.timedFraction(of: untimed), 0)
+        XCTAssertLessThan(
+            BatchSpeakerRelabeler.timedFraction(of: untimed),
+            BatchSpeakerRelabeler.minimumTimedFraction,
+            "sessions recorded before timings were persisted must fall back to the replace path"
+        )
+
+        let mixed = untimed + [timed(.you, "timed", 0, 1)]
+        XCTAssertEqual(BatchSpeakerRelabeler.timedFraction(of: mixed), 0.2, accuracy: 0.001)
+    }
+
     private func makeRecords(
         count: Int,
         startedAt: Date,
