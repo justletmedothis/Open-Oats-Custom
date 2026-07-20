@@ -374,6 +374,16 @@ struct ContentView: View {
                 container.disableDetection(coordinator: coordinator)
             }
         }
+        .onChange(of: coordinator.pendingExternalCommand?.id) {
+            // Deep links that arrive while the app is already running queue a
+            // command here. Without this the queue was only drained once, when
+            // the view first appeared, so openoats://start and openoats://stop
+            // silently did nothing unless the URL launched the app.
+            guard let controller = liveSessionController else { return }
+            controller.handlePendingExternalCommandIfPossible(settings: settings) {
+                openWindow(id: "notes")
+            }
+        }
         .onChange(of: settings.calendarIntegrationEnabled) {
             container.updateCalendarIntegration(enabled: settings.calendarIntegrationEnabled)
         }

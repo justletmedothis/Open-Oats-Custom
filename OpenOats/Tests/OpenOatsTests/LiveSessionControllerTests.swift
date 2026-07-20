@@ -154,6 +154,31 @@ final class LiveSessionControllerTests: XCTestCase {
         }
     }
 
+    func testDeferredBatchQueueDedupesAndPreservesOrder() {
+        // A batch pass cancelled by the next meeting starting must come back:
+        // back-to-back meetings used to cost the earlier one its speaker
+        // refinement silently.
+        let dirs = makeTempDirs()
+        let settings = makeSettings(notesDirectory: dirs.notes)
+        let (controller, _) = makeLiveController(
+            root: dirs.root,
+            notesDirectory: dirs.notes,
+            settings: settings
+        )
+
+        XCTAssertTrue(controller.deferredBatchSessionIDs.isEmpty)
+
+        controller.enqueueDeferredBatch("session_a")
+        controller.enqueueDeferredBatch("session_b")
+        controller.enqueueDeferredBatch("session_a")
+
+        XCTAssertEqual(
+            controller.deferredBatchSessionIDs,
+            ["session_a", "session_b"],
+            "queue keeps interruption order and never queues a session twice"
+        )
+    }
+
     func testCloudStartPreflightBlocksMissingAPIKey() async {
         let dirs = makeTempDirs()
         let settings = makeSettings(notesDirectory: dirs.notes)

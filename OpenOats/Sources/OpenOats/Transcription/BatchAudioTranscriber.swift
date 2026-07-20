@@ -460,10 +460,28 @@ actor BatchAudioTranscriber {
         }
         currentTask = task
         await task.value
+        // Release the finished job: resetStatusIfStillTerminal only clears a
+        // terminal status once no task is held, so leaving this set pinned
+        // status at .completed for the rest of the app run (which also kept
+        // the re-transcribe menu item disabled).
+        if currentTask == task { currentTask = nil }
     }
 
-    func cancel() async {
+    /// Cancels any running job. Returns the session whose re-transcription was
+    /// interrupted (nil when nothing was running or the job was a file import),
+    /// so the caller can queue it to run once the machine is free again.
+    @discardableResult
+    func cancel() async -> String? {
         let task = currentTask
+        // Only a job still doing work counts as interrupted. currentTask and
+        // activeSessionID both outlive a finished run, so keying off them alone
+        // re-queued sessions whose pass had already completed a second earlier.
+        let inFlight: Bool
+        switch status {
+        case .loading, .transcribing: inFlight = true
+        case .idle, .completed, .cancelled, .failed: inFlight = false
+        }
+        let interrupted = (inFlight && !isImporting) ? activeSessionID : nil
         currentTask = nil
         task?.cancel()
         await task?.value
@@ -476,6 +494,7 @@ actor BatchAudioTranscriber {
         }
         isImporting = false
         activeSessionID = nil
+        return interrupted
     }
 
     // MARK: - Audio Import
@@ -518,6 +537,7 @@ actor BatchAudioTranscriber {
         }
         currentTask = task
         await task.value
+        if currentTask == task { currentTask = nil }
     }
 
     private func runImport(

@@ -360,6 +360,10 @@ final class LiveSessionController {
                 }
             }
 
+            // Outside the busy branch on purpose: the queue drains precisely
+            // when nothing is running, which is when that branch is skipped.
+            runDeferredBatchRetranscriptionIfNeeded(settings: settings)
+
             syncProjectedState(settings: settings)
         }
     }
@@ -635,6 +639,12 @@ final class LiveSessionController {
     /// letting it start capture for a session that already ended.
     var activeStartTask: Task<Void, Never>?
 
+    /// Sessions whose batch pass was cancelled to free memory for a new
+    /// meeting. They run once nothing else is competing for the machine.
+    /// Not persisted: quitting the app drops the queue, and those sessions
+    /// stay re-runnable from the transcript's re-transcribe action.
+    private(set) var deferredBatchSessionIDs: [String] = []
+
     private static func appendingMarkdownBlock(_ block: String, to existing: String) -> String {
         guard !existing.isEmpty else { return block }
         return existing + "\n\n" + block
@@ -703,7 +713,15 @@ final class LiveSessionController {
             // model-download awaits are not cancellable mid-flight. A wedged
             // batch must not hold the Start button hostage — after 10 s we
             // abandon the old job and start the meeting anyway.
-            let cancelTask = Task { await batchAudioTranscriber.cancel() }
+            // The cancelled session is queued from inside the task (rather than
+            // read from its result) so a wedged cancel still enqueues whenever
+            // it eventually unwinds, without the Start button waiting on it.
+            let cancelTask = Task { [weak self] in
+                let interrupted = await batchAudioTranscriber.cancel()
+                if let interrupted {
+                    await self?.enqueueDeferredBatch(interrupted)
+                }
+            }
             let finished = await TranscriptionEngine.awaitTeardown(
                 of: [cancelTask], timeoutSeconds: 10
             )
@@ -1131,31 +1149,92 @@ final class LiveSessionController {
         }
 
         // 9. Kick off batch transcription if enabled
-        if let settings, willRunBatchRetranscription, let batchAudioTranscriber = coordinator.batchAudioTranscriber {
-            let batchSessionID = sessionID
-            let batchModel = settings.batchTranscriptionModel
-            let batchLocale = settings.locale
-            let notesDir = URL(fileURLWithPath: settings.notesFolderPath)
-            let repo = coordinator.sessionRepository
-            let diarize = settings.enableDiarization
-            let diarizeMic = settings.enableMicDiarization
-            let diarizeVariant = settings.diarizationVariant
-            let expectedSpeakers = settings.expectedInRoomSpeakers > 0 ? settings.expectedInRoomSpeakers : nil
-            let selfReferences = coordinator.transcriptionEngine?.lastLiveSelfReferences ?? []
-            Task.detached { [batchAudioTranscriber] in
-                await batchAudioTranscriber.process(
-                    sessionID: batchSessionID,
-                    model: batchModel,
-                    locale: batchLocale,
-                    sessionRepository: repo,
-                    notesDirectory: notesDir,
-                    enableDiarization: diarize,
-                    enableMicDiarization: diarizeMic,
-                    diarizationVariant: diarizeVariant,
-                    expectedInRoomSpeakers: expectedSpeakers,
-                    liveSelfReferences: selfReferences
+        if let settings, willRunBatchRetranscription {
+            launchBatchRetranscription(sessionID: sessionID, settings: settings)
+        }
+    }
+
+    /// Starts the post-meeting batch pass for a session. Used both when a
+    /// meeting ends and when catching up a session whose pass was interrupted
+    /// by the next meeting starting.
+    private func launchBatchRetranscription(
+        sessionID: String,
+        settings: AppSettings,
+        liveSelfReferences: [[Float]]? = nil
+    ) {
+        guard let batchAudioTranscriber = coordinator.batchAudioTranscriber else { return }
+        let batchModel = settings.batchTranscriptionModel
+        let batchLocale = settings.locale
+        let notesDir = URL(fileURLWithPath: settings.notesFolderPath)
+        let repo = coordinator.sessionRepository
+        let diarize = settings.enableDiarization
+        let diarizeMic = settings.enableMicDiarization
+        let diarizeVariant = settings.diarizationVariant
+        let expectedSpeakers = settings.expectedInRoomSpeakers > 0 ? settings.expectedInRoomSpeakers : nil
+        let selfReferences = liveSelfReferences
+            ?? coordinator.transcriptionEngine?.lastLiveSelfReferences
+            ?? []
+        Task.detached { [batchAudioTranscriber] in
+            await batchAudioTranscriber.process(
+                sessionID: sessionID,
+                model: batchModel,
+                locale: batchLocale,
+                sessionRepository: repo,
+                notesDirectory: notesDir,
+                enableDiarization: diarize,
+                enableMicDiarization: diarizeMic,
+                diarizationVariant: diarizeVariant,
+                expectedInRoomSpeakers: expectedSpeakers,
+                liveSelfReferences: selfReferences
+            )
+        }
+    }
+
+    func enqueueDeferredBatch(_ sessionID: String) {
+        guard !deferredBatchSessionIDs.contains(sessionID) else { return }
+        deferredBatchSessionIDs.append(sessionID)
+        DiagnosticsSupport.record(
+            category: "batch",
+            message: "Deferred batch for \(sessionID): a new meeting started"
+        )
+    }
+
+    /// Runs the batch pass for a session that was interrupted by a new meeting
+    /// starting. Without this, back-to-back meetings silently cost the earlier
+    /// one its speaker refinement: the pass is cancelled to keep memory free
+    /// for the live recording and never came back.
+    private func runDeferredBatchRetranscriptionIfNeeded(settings: AppSettings) {
+        guard !deferredBatchSessionIDs.isEmpty else { return }
+        guard coordinator.batchAudioTranscriber != nil else { return }
+        // Never compete with a live recording or another batch job for memory:
+        // that contention is why the pass gets cancelled in the first place.
+        guard !state.isRunning else { return }
+        guard coordinator.batchStatus == .idle else { return }
+
+        let sessionID = deferredBatchSessionIDs.removeFirst()
+        Task { [weak self] in
+            guard let self else { return }
+            // The audio stems are pruned on a bounded schedule; a session whose
+            // stems already expired can never be re-run.
+            let urls = await self.coordinator.sessionRepository.batchAudioURLs(sessionID: sessionID)
+            guard urls.mic != nil || urls.sys != nil else {
+                DiagnosticsSupport.record(
+                    category: "batch",
+                    message: "Deferred batch for \(sessionID) skipped: retained audio is gone"
                 )
+                self.runDeferredBatchRetranscriptionIfNeeded(settings: settings)
+                return
             }
+            DiagnosticsSupport.record(category: "batch", message: "Running deferred batch for \(sessionID)")
+            Log.batchTranscription.info("Running deferred batch pass for \(sessionID, privacy: .public)")
+            // Self-voice references belong to the interrupted session's live
+            // pass and are long gone; the batch pass falls back to the enrolled
+            // voiceprint, which is what a manual re-transcribe uses too.
+            self.launchBatchRetranscription(
+                sessionID: sessionID,
+                settings: settings,
+                liveSelfReferences: []
+            )
         }
     }
 

@@ -66,8 +66,11 @@ public struct OpenOatsRootApp: App {
                 .task {
                     await whatsNewController.presentPostUpdateReleaseNotesIfNeeded()
                 }
+                // Handles URLs that launch the app; once it is running the
+                // Apple Event goes to AppDelegate.application(_:open:) instead.
                 .onOpenURL { url in
                     guard let command = OpenOatsDeepLink.parse(url) else { return }
+                    DiagnosticsSupport.record(category: "app", message: "Deep link received: \(url.absoluteString)")
                     // Restore visibility when app is in background mode (LSUIElement)
                     if NSApp.activationPolicy() == .accessory {
                         NSApp.setActivationPolicy(.regular)
@@ -430,6 +433,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         registerGlobalHotkeys()
+    }
+
+    /// SwiftUI's .onOpenURL only fires for URLs that launch the app: once the
+    /// app is running the Apple Event arrives here and never reaches the
+    /// WindowGroup, which made openoats://start and openoats://stop silently do
+    /// nothing on a running app. AppKit-level delivery always fires.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let coordinator else { return }
+        for url in urls {
+            guard let command = OpenOatsDeepLink.parse(url) else {
+                DiagnosticsSupport.record(category: "app", message: "Ignored deep link \(url.absoluteString)")
+                continue
+            }
+            DiagnosticsSupport.record(category: "app", message: "Deep link received: \(url.absoluteString)")
+            if NSApp.activationPolicy() == .accessory {
+                NSApp.setActivationPolicy(.regular)
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            switch command {
+            case .openNotes(let sessionID):
+                coordinator.queueSessionSelection(sessionID)
+                showMainWindowAction?()
+            default:
+                coordinator.queueExternalCommand(command)
+            }
+        }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
