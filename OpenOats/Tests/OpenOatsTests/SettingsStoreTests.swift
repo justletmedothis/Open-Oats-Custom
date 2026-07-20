@@ -848,6 +848,40 @@ final class SettingsStoreTests: XCTestCase {
         let _: AppSettingsStorage.Type = SettingsStorage.self
     }
 
+    func testFailedSecretLoadRetriesInsteadOfCachingEmpty() {
+        // The field failure: an ad-hoc rebuild's Keychain read is denied once at
+        // launch, the empty result was cached for the whole run, and every LLM
+        // feature died silently. A failure must not be cached as "no key".
+        let tracker = LoadTracker()
+        let secretStore = AppSecretStore(
+            loadResult: { key in
+                tracker.loadedKeys.append(key)
+                return tracker.loadedKeys.count == 1
+                    ? .failure(errSecAuthFailed)
+                    : .found("sk-recovered")
+            },
+            saveValue: { _, _ in }
+        )
+
+        let store = makeStore(secretStore: secretStore)
+
+        XCTAssertEqual(store.openRouterApiKey, "", "denied read yields no key yet")
+        XCTAssertEqual(tracker.loadedKeys.count, 1)
+
+        // Inside the retry cooldown the failure isn't re-probed on every access.
+        XCTAssertEqual(store.openRouterApiKey, "")
+        XCTAssertEqual(tracker.loadedKeys.count, 1)
+
+        // Once the cooldown lapses the next access retries and recovers.
+        store.secretRetryInterval = 0
+        XCTAssertEqual(store.openRouterApiKey, "sk-recovered")
+        XCTAssertEqual(tracker.loadedKeys.count, 2)
+
+        // Recovered value is cached; no further store hits.
+        XCTAssertEqual(store.openRouterApiKey, "sk-recovered")
+        XCTAssertEqual(tracker.loadedKeys.count, 2)
+    }
+
     func testSecretsLoadLazily() {
         let tracker = LoadTracker()
         let secretStore = AppSecretStore(

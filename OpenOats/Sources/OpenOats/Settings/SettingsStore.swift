@@ -12,6 +12,10 @@ final class SettingsStore {
     private static let enableLiveTranscriptCleanupLegacyKey = "enableTranscriptRefinement"
     private static let enableBatchRetranscriptionLegacyKey = "enableBatchRefinement"
     @ObservationIgnored private var loadedSecretKeys: Set<String> = []
+    @ObservationIgnored private var failedSecretLoads: [String: Date] = [:]
+    /// Minimum spacing between Keychain retries after a failed read. Internal
+    /// so tests can shrink it.
+    @ObservationIgnored var secretRetryInterval: TimeInterval = 20
 
     private static func normalizedIdentifierList(_ values: [String]) -> [String] {
         var result: [String] = []
@@ -36,10 +40,29 @@ final class SettingsStore {
         assign: (String) -> Void
     ) -> String {
         guard !loadedSecretKeys.contains(key) else { return currentValue }
-        let value = secretStore.load(key: key) ?? ""
-        loadedSecretKeys.insert(key)
-        assign(value)
-        return value
+        if let failedAt = failedSecretLoads[key],
+           Date.now.timeIntervalSince(failedAt) < secretRetryInterval {
+            return currentValue
+        }
+        switch secretStore.load(key: key) {
+        case .found(let value):
+            loadedSecretKeys.insert(key)
+            failedSecretLoads[key] = nil
+            assign(value)
+            return value
+        case .missing:
+            loadedSecretKeys.insert(key)
+            failedSecretLoads[key] = nil
+            assign("")
+            return ""
+        case .failure:
+            // A denied or errored Keychain read says nothing about whether the
+            // secret exists. Caching "" here is what used to disable every LLM
+            // feature for the whole app run; keep retrying (spaced out) so an
+            // approved access prompt or unlocked keychain recovers in place.
+            failedSecretLoads[key] = .now
+            return currentValue
+        }
     }
 
     private func markSecretLoaded(_ key: String) {

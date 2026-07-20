@@ -67,7 +67,13 @@ final class SidecastEngine {
 
         guard settings.sidebarMode == .sidecast else { return }
         guard !settings.enabledSidecastPersonas.isEmpty else { return }
-        guard canCallLLM else { return }
+        guard canCallLLM else {
+            // Dying silently here left the panel on "Listening…" for a whole
+            // meeting; say what's missing so it reads as a fixable setup issue.
+            lastErrorMessage = missingCredentialMessage
+            return
+        }
+        if lastErrorMessage == missingCredentialMessage { lastErrorMessage = nil }
 
         pendingUtterance = utterance
         maybeStartGeneration()
@@ -610,6 +616,16 @@ final class SidecastEngine {
         // "nothing to say" line. Reject shapeless objects (legacy wrapper).
         guard candidate.personaID != nil || candidate.personaName != nil || candidate.hadSpeakKey else { return nil }
         return candidate
+    }
+
+    /// Why canCallLLM is false, phrased for the panel.
+    private var missingCredentialMessage: String {
+        switch settings.llmProvider {
+        case .openRouter, .requesty, .openAI, .anthropic:
+            "No \(settings.llmProvider.displayName) API key is loaded. Re-enter it in Settings > Intelligence."
+        case .ollama, .lmStudio, .mlx, .openAICompatible:
+            "No server URL is set for \(settings.llmProvider.displayName). Check Settings > Intelligence."
+        }
     }
 
     private var canCallLLM: Bool {

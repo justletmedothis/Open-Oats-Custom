@@ -28,3 +28,6 @@ docs/superpowers/
 # Demo knowledge bases
 demo-kb/
 demo-kb-investor/
+
+# Local code signing identity pin (machine-specific)
+.codesign-identity

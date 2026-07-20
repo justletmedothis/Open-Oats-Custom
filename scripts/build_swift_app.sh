@@ -103,15 +103,6 @@ while IFS= read -r -d '' bundle; do
   destination="$APP_DIR/Contents/Resources/$bundle_name"
   rm -rf "$destination"
   cp -R "$bundle" "$destination"
-  # swift build's generated Bundle.module accessor only checks the .app ROOT
-  # (Bundle.main.bundleURL) and the absolute .build path baked in at compile
-  # time. Contents/Resources alone is NOT enough: if .build moves or is
-  # cleaned, Bundle.module fatalErrors at runtime (KeyboardShortcuts crashes
-  # Settings this way). Ship a copy at the bundle root so the app is
-  # self-contained. Note: root-level files break identity codesigning; if we
-  # ever sign these builds, this needs a different approach.
-  rm -rf "$APP_DIR/$bundle_name"
-  cp -R "$bundle" "$APP_DIR/$bundle_name"
   COPIED_BUNDLES=$((COPIED_BUNDLES + 1))
 done < <(find "$SWIFT_DIR/.build" -path "*/release/*.bundle" -type d -print0)
 if [[ $COPIED_BUNDLES -gt 0 ]]; then
@@ -128,11 +119,20 @@ echo "App bundle created: $APP_DIR"
 if [[ "$SKIP_SIGN" == "1" ]]; then
   echo "Skipping code signing"
 else
-  # Auto-detect signing identity if not set
+  # Local identity pin: a .codesign-identity file at the repo root (gitignored)
+  # holding a certificate hash or name. Signing every build with the SAME
+  # identity is what keeps Keychain ACLs and TCC grants (mic!) valid across
+  # rebuilds; ad-hoc signatures change every build and macOS treats each one
+  # as a brand-new app.
+  if [[ -z "${CODESIGN_IDENTITY:-}" && -f "$ROOT_DIR/.codesign-identity" ]]; then
+    CODESIGN_IDENTITY="$(head -1 "$ROOT_DIR/.codesign-identity" | tr -d '[:space:]')"
+  fi
+
+  # Auto-detect signing identity if not set (skip revoked certificates)
   if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
-    CODESIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)
+    CODESIGN_IDENTITY=$(security find-identity -v -p codesigning | grep -v CSSMERR | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)
     if [[ -z "$CODESIGN_IDENTITY" ]]; then
-      CODESIGN_IDENTITY=$(security find-identity -v -p codesigning | grep "Apple Development" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)
+      CODESIGN_IDENTITY=$(security find-identity -v -p codesigning | grep -v CSSMERR | grep "Apple Development" | head -1 | sed 's/.*"\(.*\)"/\1/' || true)
     fi
   fi
 
@@ -182,6 +182,27 @@ else
   else
     echo "Warning: No signing identity found. App will be unsigned."
   fi
+fi
+
+# Root-level SPM resource bundle copies, AFTER signing. swift build's generated
+# Bundle.module accessor checks exactly two paths: the .app ROOT
+# (Bundle.main.bundleURL) and the absolute .build path baked in at compile
+# time. Contents/Resources alone is NOT enough: if .build moves or is cleaned,
+# Bundle.module fatalErrors at runtime (KeyboardShortcuts crashes Settings this
+# way). codesign refuses to sign a bundle with root-level files ("unsealed
+# contents present in the bundle root"), so they are added after the seal.
+# Static verification of the installed app will flag them, but the process's
+# dynamic code identity (what Keychain ACLs and TCC evaluate) stays valid, and
+# local unquarantined launches never go through Gatekeeper assessment.
+ROOT_BUNDLES=0
+while IFS= read -r -d '' bundle; do
+  bundle_name="$(basename "$bundle")"
+  rm -rf "$APP_DIR/$bundle_name"
+  cp -R "$bundle" "$APP_DIR/$bundle_name"
+  ROOT_BUNDLES=$((ROOT_BUNDLES + 1))
+done < <(find "$SWIFT_DIR/.build" -path "*/release/*.bundle" -type d -print0)
+if [[ $ROOT_BUNDLES -gt 0 ]]; then
+  echo "Placed $ROOT_BUNDLES SPM resource bundle(s) at the bundle root (post-sign)"
 fi
 
 if [[ "$SKIP_INSTALL" == "1" ]]; then
