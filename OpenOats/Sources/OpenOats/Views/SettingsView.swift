@@ -729,15 +729,24 @@ private struct TranscriptionSettingsTab: View {
     @ViewBuilder
     private var expectedSpeakersRow: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Stepper(value: $settings.expectedInRoomSpeakers, in: 0...12) {
-                HStack {
-                    Text("Expected in-room speakers")
-                        .font(.system(size: 12))
-                    Spacer()
-                    Text(settings.expectedInRoomSpeakers == 0 ? "Auto" : "\(settings.expectedInRoomSpeakers)")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Stepper(value: $settings.expectedInRoomSpeakers, in: 0...12) {
+                    HStack {
+                        Text("Expected in-room speakers")
+                            .font(.system(size: 12))
+                        Spacer()
+                        Text(settings.expectedInRoomSpeakers == 0 ? "Auto" : "\(settings.expectedInRoomSpeakers)")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                Button("Auto") {
+                    settings.expectedInRoomSpeakers = 0
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .disabled(settings.expectedInRoomSpeakers == 0)
+                .help("No cap: let any number of in-person voices split off")
             }
             Text("Including you. Caps how many different in-person voices the batch pass separates, so it stops splitting one person into several. Leave on Auto to detect the count. Remote callers on a call are counted separately. You can also re-diarize a finished meeting with an exact count from its transcript.")
                 .font(.system(size: 11))

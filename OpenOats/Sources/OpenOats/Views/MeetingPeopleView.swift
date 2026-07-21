@@ -139,18 +139,27 @@ struct MeetingPeopleView: View {
     @ViewBuilder
     private var expectedSpeakersSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Stepper(value: $settings.expectedInRoomSpeakers, in: 0...12) {
-                HStack {
-                    Text("In-room people")
-                        .font(.system(size: 12, weight: .medium))
-                    Spacer()
-                    Text(settings.expectedInRoomSpeakers == 0 ? "Auto" : "\(settings.expectedInRoomSpeakers)")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
+            HStack(spacing: 8) {
+                Stepper(value: $settings.expectedInRoomSpeakers, in: 0...12) {
+                    HStack {
+                        Text("In-room people")
+                            .font(.system(size: 12, weight: .medium))
+                        Spacer()
+                        Text(settings.expectedInRoomSpeakers == 0 ? "Auto" : "\(settings.expectedInRoomSpeakers)")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
                 }
+                Button("Auto") {
+                    settings.expectedInRoomSpeakers = 0
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .disabled(settings.expectedInRoomSpeakers == 0)
+                .help("No cap: let any number of in-person voices split off")
             }
-            Text("Counting you. Caps how many in-person voices get separated, both live and in the final transcript. Change it any time: raising it mid-meeting lets an extra voice split off from then on.")
+            Text("Counting you. Caps how many in-person voices get separated, both live and in the final transcript. Change it any time: raising it mid-meeting lets an extra voice split off from then on. Auto puts no cap on it.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
