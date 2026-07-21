@@ -208,6 +208,9 @@ fi
 if [[ "$SKIP_INSTALL" == "1" ]]; then
   echo "Skipping installation to /Applications"
 else
+  # cp -R over an existing install fails on read-only files (e.g. bundled
+  # .lproj strings) and leaves a half-updated app. Replace it wholesale.
+  rm -rf "/Applications/$APP_NAME.app"
   cp -R "$APP_DIR" /Applications/
   echo "Installed to /Applications/$APP_NAME.app"
 fi
