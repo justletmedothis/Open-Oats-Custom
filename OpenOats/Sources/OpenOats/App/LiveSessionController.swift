@@ -384,6 +384,7 @@ final class LiveSessionController {
         container.ensureMeetingServicesInitialized(settings: settings, coordinator: coordinator)
         coordinator.suggestionEngine?.clear()
         coordinator.sidecastEngine?.clear()
+        coordinator.liveChatEngine?.clear()
         // Auto-started sessions can begin inside the idle polling gap, so an
         // idle tick isn't guaranteed to have reset these between sessions.
         micLagTracker.reset()

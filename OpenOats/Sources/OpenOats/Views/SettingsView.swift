@@ -1116,6 +1116,14 @@ private struct IntelligenceSettingsTab: View {
                     }
                 }
 
+                Section("Live meeting chat") {
+                    Toggle("Show Ask panel during recording", isOn: $settings.liveChatEnabled)
+                        .font(.system(size: 12))
+                    Text("Chat with your notes model mid-meeting. Each question is answered from a snapshot of the transcript taken the moment you send it.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Classic Suggestions") {
                     Toggle("Floating suggestion panel", isOn: $settings.suggestionPanelEnabled)
                         .font(.system(size: 12))

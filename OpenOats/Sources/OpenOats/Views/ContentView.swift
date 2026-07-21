@@ -194,6 +194,14 @@ struct ContentView: View {
                     .padding(.vertical, 8)
                 }
 
+                if settings.liveChatEnabled, let liveChatEngine = coordinator.liveChatEngine {
+                    Divider()
+                    LiveChatSection(
+                        engine: liveChatEngine,
+                        speakerNames: controllerState.displaySpeakerNames
+                    )
+                }
+
                 Divider()
                 ScratchpadSection(
                     text: Binding(

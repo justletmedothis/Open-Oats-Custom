@@ -138,11 +138,16 @@ final class AppContainer {
             knowledgeBase: knowledgeBase,
             settings: settings
         )
+        let liveChatEngine = LiveChatEngine(
+            transcriptStore: coordinator.transcriptStore,
+            settings: settings
+        )
 
         return AppViewServices(
             knowledgeBase: knowledgeBase,
             suggestionEngine: suggestionEngine,
-            sidecastEngine: sidecastEngine
+            sidecastEngine: sidecastEngine,
+            liveChatEngine: liveChatEngine
         )
     }
 
@@ -185,7 +190,8 @@ final class AppContainer {
         coordinator.setViewServices(
             knowledgeBase: services.knowledgeBase,
             suggestionEngine: services.suggestionEngine,
-            sidecastEngine: services.sidecastEngine
+            sidecastEngine: services.sidecastEngine,
+            liveChatEngine: services.liveChatEngine
         )
     }
 

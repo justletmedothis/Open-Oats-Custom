@@ -565,6 +565,17 @@ final class SettingsStore {
         }
     }
 
+    @ObservationIgnored nonisolated(unsafe) private var _liveChatEnabled: Bool
+    var liveChatEnabled: Bool {
+        get { access(keyPath: \.liveChatEnabled); return _liveChatEnabled }
+        set {
+            withMutation(keyPath: \.liveChatEnabled) {
+                _liveChatEnabled = newValue
+                defaults.set(newValue, forKey: "liveChatEnabled")
+            }
+        }
+    }
+
     @ObservationIgnored nonisolated(unsafe) private var _suggestionsAlwaysOnTop: Bool
     var suggestionsAlwaysOnTop: Bool {
         get { access(keyPath: \.suggestionsAlwaysOnTop); return _suggestionsAlwaysOnTop }
@@ -1517,6 +1528,11 @@ final class SettingsStore {
             self._suggestionsAlwaysOnTop = true
         } else {
             self._suggestionsAlwaysOnTop = defaults.bool(forKey: "suggestionsAlwaysOnTop")
+        }
+        if defaults.object(forKey: "liveChatEnabled") == nil {
+            self._liveChatEnabled = true
+        } else {
+            self._liveChatEnabled = defaults.bool(forKey: "liveChatEnabled")
         }
         self._sidebarMode = SidebarMode(rawValue: defaults.string(forKey: "sidebarMode") ?? "") ?? .classicSuggestions
         self._sidecastIntensity = SidecastIntensity(rawValue: defaults.string(forKey: "sidecastIntensity") ?? "") ?? .balanced

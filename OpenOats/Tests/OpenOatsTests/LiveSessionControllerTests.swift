@@ -575,6 +575,10 @@ final class LiveSessionControllerTests: XCTestCase {
                 transcriptStore: coordinator.transcriptStore,
                 knowledgeBase: knowledgeBase,
                 settings: settings
+            ),
+            liveChatEngine: LiveChatEngine(
+                transcriptStore: coordinator.transcriptStore,
+                settings: settings
             )
         )
 
@@ -1574,6 +1578,10 @@ final class LiveSessionControllerTests: XCTestCase {
             sidecastEngine: SidecastEngine(
                 transcriptStore: coordinator.transcriptStore,
                 knowledgeBase: knowledgeBase,
+                settings: settings
+            ),
+            liveChatEngine: LiveChatEngine(
+                transcriptStore: coordinator.transcriptStore,
                 settings: settings
             )
         )
